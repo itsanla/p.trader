@@ -1,80 +1,71 @@
-import { int, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { int, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
-// D1 is the source of truth. Upstash Redis only caches hot reads on top of this.
-// All timestamps are epoch milliseconds (int).
+// D1 is the source of truth. Upstash Redis only caches the live Groq key state.
+// All timestamps are epoch milliseconds (int) unless noted.
 
-// // ── Chat history (source of truth; Redis caches the recent window) ────────────
-// export const messages = sqliteTable("messages", {
-//   id: int().primaryKey({ autoIncrement: true }),
-//   phone: text().notNull(),
-//   role: text().notNull(), // "user" | "assistant"
-//   content: text().notNull(),
-//   keyUsed: text("key_used"), // Groq key index that produced an assistant message
-//   modelUsed: text("model_used"),
-//   createdAt: int("created_at").notNull(),
-// });
+// ── Every analysis the agent runs (executed or not) ───────────────────────────
+export const analyses = sqliteTable("analyses", {
+  id: text().primaryKey(), // uuid
+  symbol: text().notNull(),
+  ts: int().notNull(), // when the analysis ran
+  price: real().notNull(), // reference price at decision time
+  snapshot: text().notNull(), // JSON MarketSnapshot (indicators, multi-timeframe)
+  trigger: text().notNull().default(""), // what rule woke the LLM (or "scheduled")
+  action: text().notNull(), // BUY | SELL | HOLD
+  confidence: int().notNull().default(0),
+  timeframeBias: text("timeframe_bias").notNull().default("neutral"),
+  reasoning: text().notNull().default(""),
+  keyFactors: text("key_factors").notNull().default("[]"), // JSON string[]
+  stopLoss: real("stop_loss"),
+  takeProfit: text("take_profit"), // JSON number[]
+  invalidation: text().notNull().default(""),
+  executed: int().notNull().default(0), // 1 if a trade was placed
+  keyUsed: text("key_used"),
+  modelUsed: text("model_used"),
+  // Outcome (filled in later by the evaluator) — closes the learning loop.
+  outcomePnlPct: real("outcome_pnl_pct"),
+  outcomeCorrect: int("outcome_correct"), // 1 right / 0 wrong / null not-yet
+  evaluatedAt: int("evaluated_at"),
+});
 
-// // ── Conversation metadata (one row per phone) ─────────────────────────────────
-// export const conversations = sqliteTable("conversations", {
-//   phone: text().primaryKey(),
-//   name: text(),
-//   lastActive: int("last_active").notNull().default(0),
-//   totalMessages: int("total_messages").notNull().default(0),
-//   lastMessage: text("last_message").notNull().default(""),
-//   // ms timestamp of the latest INBOUND (user) message — defines WhatsApp's 24h window.
-//   lastInbound: int("last_inbound"),
-// });
+// ── Executed trades (demo orders on Bybit) ────────────────────────────────────
+export const trades = sqliteTable("trades", {
+  id: text().primaryKey(), // our orderLinkId (uuid)
+  analysisId: text("analysis_id").notNull(),
+  symbol: text().notNull(),
+  side: text().notNull(), // Buy | Sell
+  orderType: text("order_type").notNull().default("Market"),
+  qty: real().notNull(), // base-coin quantity
+  price: real().notNull(), // fill / reference price
+  stopLoss: real("stop_loss"),
+  takeProfit: real("take_profit"),
+  status: text().notNull().default("submitted"), // submitted|filled|rejected|closed
+  bybitOrderId: text("bybit_order_id"),
+  error: text(),
+  createdAt: int("created_at").notNull(),
+  closedAt: int("closed_at"),
+  exitPrice: real("exit_price"),
+  pnlQuote: real("pnl_quote"),
+});
 
-// // ── Rolling conversation summary (was Redis chat:summary) ─────────────────────
-// export const summaries = sqliteTable("summaries", {
-//   phone: text().primaryKey(),
-//   summary: text().notNull().default(""),
-//   updatedAt: int("updated_at").notNull(),
-// });
+// ── Long-term semantic memory (mirror of Vectorize; id == vector id) ──────────
+export const marketMemory = sqliteTable("market_memory", {
+  id: text().primaryKey(), // also the Vectorize vector id
+  symbol: text().notNull(),
+  text: text().notNull(), // the "market fingerprint" + decision + outcome line
+  createdAt: int("created_at").notNull(),
+});
 
-// // ── Long-term memory facts (mirror of Vectorize entries; id == vector id) ─────
-// export const memoryFacts = sqliteTable("memory_facts", {
-//   id: text().primaryKey(), // also the Vectorize vector id
-//   phone: text().notNull(),
-//   fact: text().notNull(),
-//   createdAt: int("created_at").notNull(),
-// });
-
-// // ── Tavily credit usage, per (month, key) — Tavily credits reset monthly ──────
-// export const tavilyUsage = sqliteTable(
-//   "tavily_usage",
-//   {
-//     month: text().notNull(), // YYYY-MM (UTC)
-//     keyIndex: int("key_index").notNull(),
-//     creditsUsed: int("credits_used").notNull().default(0),
-//     searches: int().notNull().default(0),
-//     lastUpdated: int("last_updated").notNull().default(0),
-//   },
-//   (t) => [primaryKey({ columns: [t.month, t.keyIndex] })],
-// );
-
-// // ── Deep-research tasks (async journal pipeline, web-only) ────────────────────
-// export const researchTasks = sqliteTable("research_tasks", {
-//   id: text().primaryKey(), // uuid
-//   topic: text().notNull(),
-//   status: text().notNull().default("pending"), // pending|running|done|error
-//   stage: text().notNull().default(""), // human-readable progress label
-//   manuscript: text(), // JSON: { title, abstract, keywords, sections[], references[] }
-//   error: text(),
-//   createdAt: int("created_at").notNull(),
-//   updatedAt: int("updated_at").notNull(),
-// });
-
-// // ── Groq usage counters, per (day, key, model) — source of truth for /usage ───
-// export const usageCounters = sqliteTable(
-//   "usage_counters",
-//   {
-//     date: text().notNull(), // YYYY-MM-DD (UTC)
-//     keyIndex: int("key_index").notNull(),
-//     model: text().notNull(),
-//     totalTokens: int("total_tokens").notNull().default(0),
-//     totalRequests: int("total_requests").notNull().default(0),
-//     lastUpdated: int("last_updated").notNull().default(0),
-//   },
-//   (t) => [primaryKey({ columns: [t.date, t.keyIndex, t.model] })],
-// );
+// ── Groq usage counters, per (day, key, model) — drives rotation + /usage ──────
+export const usageCounters = sqliteTable(
+  "usage_counters",
+  {
+    date: text().notNull(), // YYYY-MM-DD (UTC)
+    keyIndex: int("key_index").notNull(),
+    model: text().notNull(),
+    totalTokens: int("total_tokens").notNull().default(0),
+    totalRequests: int("total_requests").notNull().default(0),
+    lastUpdated: int("last_updated").notNull().default(0),
+  },
+  (t) => [primaryKey({ columns: [t.date, t.keyIndex, t.model] })],
+);
