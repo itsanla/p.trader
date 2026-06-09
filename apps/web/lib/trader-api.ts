@@ -91,3 +91,47 @@ export async function toggleBot(enabled: boolean): Promise<{ ok: boolean; error?
   if (!res.ok) return { ok: false, error: `Gagal (${res.status})` };
   return { ok: true };
 }
+
+export interface WithdrawResult {
+  ok: boolean;
+  error?: string;
+  note?: string;
+  sold?: { symbol: string; qty: number; ok: boolean; error?: string }[];
+}
+
+export async function withdrawAll(): Promise<WithdrawResult> {
+  const res = await fetch(`${API_BASE}/withdraw`, { method: "POST", headers: { "x-admin-secret": getAdminSecret() } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, error: (body as { error?: string }).error ?? `Gagal (${res.status})` };
+  return { ok: true, ...(body as object) };
+}
+
+// ── AI / Groq usage ───────────────────────────────────────────────────────────
+
+export interface KeyUsage {
+  index: number;
+  maskedKey: string;
+  restricted: boolean;
+  isLimited: boolean;
+  totalTokens: number;
+  totalRequests: number;
+  combinedTokenLimit: number;
+  lastUsed: string | null;
+}
+
+export interface UsageData {
+  keys: KeyUsage[];
+  combined: { totalKeys: number; combinedDailyTokenLimit: number; totalTokensToday: number; totalRequestsToday: number };
+}
+
+export interface ModelUsage {
+  model: string;
+  name: string;
+  totalTokens: number;
+  totalRequests: number;
+  tokenLimit: number;
+  requestLimit: number;
+}
+
+export const fetchUsage = () => get<UsageData>("/usage");
+export const fetchKeyDetail = (index: number) => get<{ keyIndex: number; models: ModelUsage[] }>(`/usage/${index}`);

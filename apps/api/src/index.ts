@@ -5,9 +5,9 @@ import { getAllOpenTrades, getBotState, getEquityHistory, getRealizedPnlToday, g
 import { diagnoseBybit, placeTestOrder } from "./lib/diag";
 import { logger } from "./lib/logger";
 import { flushLogs, flushLogsAsync } from "./lib/logsink";
-import { evaluateOutcomes, runCycle } from "./lib/trader";
+import { evaluateOutcomes, runCycle, sellAllToUsdt } from "./lib/trader";
 import type { TraderEnv } from "./lib/types";
-import { buildUsage } from "./lib/usage";
+import { buildKeyDetail, buildUsage } from "./lib/usage";
 
 export { TraderTicker } from "./ticker";
 
@@ -118,6 +118,27 @@ app.get("/status", async (c) => {
 });
 
 app.get("/usage", async (c) => c.json(await buildUsage(buildCtx(c.env))));
+
+app.get("/usage/:keyIndex", async (c) => {
+  const keyIndex = Number(c.req.param("keyIndex"));
+  if (!Number.isInteger(keyIndex)) return c.json({ error: "Invalid key index" }, 400);
+  return c.json({ keyIndex, models: await buildKeyDetail(buildCtx(c.env), keyIndex) });
+});
+
+// Withdraw: liquidate ALL coins to USDT. Only allowed while the bot is OFF.
+app.post("/withdraw", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
+  const ctx = buildCtx(c.env);
+  const state = await getBotState(ctx.db);
+  if (state.enabled) return c.json({ error: "Matikan bot dulu sebelum withdraw." }, 400);
+  try {
+    return c.json(await sellAllToUsdt(ctx));
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+  } finally {
+    flushLogs(c.env, c.executionCtx);
+  }
+});
 
 // ── Diagnostics (GET so a WebFetch can hit them) ──────────────────────────────
 app.get("/diag", async (c) => {

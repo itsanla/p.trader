@@ -1,6 +1,6 @@
 import type { Ctx } from "./context";
-import { getUsageForDay } from "./db";
-import { COMBINED_TPD_PER_KEY } from "./models";
+import { getUsageForDay, getUsageForKey } from "./db";
+import { COMBINED_TPD_PER_KEY, MODELS, modelInfo } from "./models";
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
@@ -44,4 +44,22 @@ export async function buildUsage(ctx: Ctx) {
     },
     updatedAt: new Date().toISOString(),
   };
+}
+
+/** Per-model usage for one key today, paired with that model's daily limit (from model.json). */
+export async function buildKeyDetail(ctx: Ctx, keyIndex: number) {
+  const rows = await getUsageForKey(ctx.db, today(), keyIndex);
+  const used = new Map(rows.map((r) => [r.model, r]));
+  return MODELS.map((m) => {
+    const r = used.get(m.id);
+    const info = modelInfo(m.id);
+    return {
+      model: m.id,
+      name: m.name,
+      totalTokens: r?.totalTokens ?? 0,
+      totalRequests: r?.totalRequests ?? 0,
+      tokenLimit: info?.tokensPerDay ?? 0,
+      requestLimit: info?.requestsPerDay ?? 0,
+    };
+  });
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import {
   fetchBot,
   fetchEquity,
@@ -8,6 +9,7 @@ import {
   getAdminSecret,
   setAdminSecret,
   toggleBot,
+  withdrawAll,
   type BotInfo,
   type EquityData,
   type EquityPoint,
@@ -37,6 +39,8 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [secret, setSecret] = useState("");
+  const [withdrawing, setWithdrawing] = useState(false);
+  const [withdrawMsg, setWithdrawMsg] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -71,6 +75,19 @@ export default function Dashboard() {
     await load();
   }
 
+  async function onWithdraw() {
+    if (!getAdminSecret()) return setError("Masukkan secret admin dulu.");
+    if (!confirm("Jual SEMUA koin ke USDT (cash)? Bot harus mati. Lanjutkan?")) return;
+    setWithdrawing(true);
+    setWithdrawMsg(null);
+    const res = await withdrawAll();
+    setWithdrawing(false);
+    if (!res.ok) return setError(res.error ?? "Withdraw gagal.");
+    setWithdrawMsg(res.note ?? "Selesai menjual ke USDT.");
+    setError(null);
+    await load();
+  }
+
   const enabled = bot?.enabled ?? false;
   const history = eq?.history ?? [];
   const latest = eq?.current?.totalUsd ?? history[history.length - 1]?.equityUsd ?? 0;
@@ -100,10 +117,26 @@ export default function Dashboard() {
             {busy ? "…" : enabled ? "■ Matikan Bot" : "▶ Nyalakan Bot"}
           </button>
         </div>
-        <div className="mt-2">
+        <div className="mt-2 flex flex-wrap items-center gap-2">
           <span className={`chip ${enabled ? "accent" : ""}`}>{enabled ? "🟢 Bot menyala — sedang berdagang" : "🔴 Bot mati — tidak berdagang"}</span>
-          {bot?.haltedDate && <span className="ml-2 text-xs" style={{ color: "var(--accent-2)" }}>kill-switch aktif hari ini</span>}
+          {bot?.haltedDate && <span className="text-xs" style={{ color: "var(--accent-2)" }}>kill-switch aktif hari ini</span>}
+          <Link href="/usage/" className="chip" style={{ textDecoration: "none" }}>
+            📊 Penggunaan AI
+          </Link>
         </div>
+
+        {/* Withdraw — only when the bot is OFF */}
+        {!enabled && (
+          <div className="mt-3 rounded-xl p-3" style={{ background: "var(--surface-2)" }}>
+            <button type="button" onClick={onWithdraw} disabled={withdrawing} className="btn-secondary" style={{ minWidth: 220 }}>
+              {withdrawing ? "Menjual semua…" : "💵 Jual Semua Koin ke USDT (Withdraw)"}
+            </button>
+            <p className="mt-2 text-xs text-muted">
+              Menjual semua koin (BTC, ETH, dll.) menjadi USDT (uang/cash). Hanya bisa saat bot mati. Nyalakan bot lagi untuk mulai berdagang dari awal.
+            </p>
+            {withdrawMsg && <p className="mt-1 text-sm" style={{ color: "var(--accent)" }}>✓ {withdrawMsg}</p>}
+          </div>
+        )}
       </section>
 
       {error && <p className="alert">{error}</p>}

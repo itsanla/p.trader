@@ -311,6 +311,47 @@ async function maybeEnterLong(ctx: Ctx, snap: MarketSnapshot, decision: Decision
   };
 }
 
+// ── Withdraw: liquidate everything to USDT ────────────────────────────────────
+
+export interface SellResult {
+  symbol: string;
+  qty: number;
+  ok: boolean;
+  error?: string;
+}
+
+/** Sell ALL non-USDT coins to USDT (cash out). Caller must ensure the bot is OFF. */
+export async function sellAllToUsdt(ctx: Ctx): Promise<{ sold: SellResult[]; note: string }> {
+  const quote = "USDT";
+  const raw = await ctx.bybit.getWalletBalance();
+  const sold: SellResult[] = [];
+  for (const [coin, bal] of Object.entries(raw.coins)) {
+    if (coin === quote || bal <= 0) continue;
+    const symbol = coin + quote;
+    try {
+      const rules = await ctx.bybit.getInstrumentRules(symbol);
+      const qty = floorToStep(bal, rules.basePrecision);
+      if (qty < rules.minOrderQty || qty <= 0) {
+        sold.push({ symbol, qty: bal, ok: false, error: "saldo terlalu kecil (dust)" });
+        continue;
+      }
+      const res = await ctx.bybit.placeMarketOrder({ symbol, side: "Sell", qtyBase: qty, orderLinkId: crypto.randomUUID().replace(/-/g, "").slice(0, 32) });
+      sold.push({ symbol, qty, ok: res.ok, error: res.error });
+    } catch (err) {
+      sold.push({ symbol, qty: bal, ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  // Mark our tracked positions closed (we just sold them).
+  const open = await getAllOpenTrades(ctx.db);
+  for (const t of open) {
+    const px = await ctx.bybit.getLastPrice(t.symbol).catch(() => t.price);
+    await closeTrade(ctx.db, t.id, px, (px - t.price) * t.qty);
+  }
+  const okCount = sold.filter((s) => s.ok).length;
+  log.info("withdraw", { sold: okCount, total: sold.length });
+  return { sold, note: `${okCount}/${sold.length} koin terjual ke USDT` };
+}
+
 // ── Learning loop ─────────────────────────────────────────────────────────────
 const EVAL_AGE_MS = 12 * 3600_000;
 const CORRECT_PNL_PCT = 0.5;
