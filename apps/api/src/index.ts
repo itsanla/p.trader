@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { buildCtx } from "./lib/context";
-import { getAllOpenTrades, getBotState, getRealizedPnlToday, getRecentAnalysesAll, setBotEnabled, setHaltedDate } from "./lib/db";
+import { getAllOpenTrades, getBotState, getEquityHistory, getRealizedPnlToday, getRecentAnalysesAll, setBotEnabled, setHaltedDate } from "./lib/db";
 import { diagnoseBybit, placeTestOrder } from "./lib/diag";
 import { logger } from "./lib/logger";
 import { flushLogs, flushLogsAsync } from "./lib/logsink";
@@ -61,6 +61,26 @@ app.get("/wallet", async (c) => {
   } finally {
     flushLogs(c.env, c.executionCtx);
   }
+});
+
+// ── Portfolio value (USD) + hourly history for the chart ──────────────────────
+app.get("/equity", async (c) => {
+  const ctx = buildCtx(c.env);
+  const history = await getEquityHistory(ctx.db, 720);
+  let current: { totalUsd: number; coins: { coin: string; usd: number; balance: number }[] } | null = null;
+  try {
+    const w = await ctx.bybit.getWalletBalance();
+    current = {
+      totalUsd: w.totalEquityQuote,
+      coins: Object.entries(w.coinsUsd)
+        .filter(([, usd]) => usd > 0.01)
+        .map(([coin, usd]) => ({ coin, usd, balance: w.coins[coin] ?? 0 }))
+        .sort((a, b) => b.usd - a.usd),
+    };
+  } catch {
+    /* still return history if wallet is briefly unavailable */
+  }
+  return c.json({ current, history });
 });
 
 // ── Bot status + on/off toggle ────────────────────────────────────────────────

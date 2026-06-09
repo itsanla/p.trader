@@ -16,8 +16,12 @@ export interface TraderEnv {
 
   // Trading config (all optional → sensible defaults in config.ts)
   TRADING_SYMBOL?: string; // primary symbol (kept for single-symbol endpoints), e.g. "BTCUSDC"
-  UNIVERSE?: string; // CSV of symbols to scan, e.g. "BTCUSDC,ETHUSDC,SOLUSDC,XRPUSDC"
-  QUOTE_COIN?: string; // e.g. "USDC"
+  UNIVERSE?: string; // optional forced symbols; the screener is the primary universe now
+  QUOTE_COIN?: string; // e.g. "USDT"
+  MIN_TURNOVER?: string; // screener: min 24h quote turnover (liquidity)
+  MAX_CHG24H?: string; // screener: drop coins moving more than this % in 24h (anomalies)
+  MAX_SPREAD_PCT?: string; // screener: drop coins with a wider bid/ask spread than this
+  SCREEN_TOP_N?: string; // screener: how many momentum leaders to deep-scan
   EXECUTE_TRADES?: string; // "true" | "false" — false = paper mode (decide + record, no order)
   MIN_CONFIDENCE?: string; // skip BUY/SELL below this (0-100)
   RISK_PCT?: string; // % of quote equity to risk per trade
@@ -154,7 +158,8 @@ export interface Decision {
 // ── Wallet & position ─────────────────────────────────────────────────────────
 
 export interface Wallet {
-  coins: Record<string, number>; // coin symbol → wallet balance
-  quote: number; // balance of the quote coin (e.g. USDC)
-  totalEquityQuote: number; // total account equity in quote currency
+  coins: Record<string, number>; // coin symbol → wallet balance (units of the coin)
+  coinsUsd: Record<string, number>; // coin symbol → value in USD
+  quote: number; // balance of the quote coin (e.g. USDT)
+  totalEquityQuote: number; // total account equity in quote/USD terms
 }

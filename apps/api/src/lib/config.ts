@@ -5,8 +5,12 @@ import type { TraderEnv } from "./types";
 
 export interface TradingConfig {
   symbol: string; // primary symbol (single-symbol endpoints/diag)
-  universe: string[]; // symbols the watcher scans every minute
+  universe: string[]; // optional forced-include symbols (screener is primary)
   quoteCoin: string;
+  minTurnover: number; // screener liquidity gate (24h quote turnover)
+  maxChg24h: number; // screener anomaly filter (% 24h)
+  maxSpreadPct: number; // screener spread filter (%)
+  screenTopN: number; // screener: momentum leaders to deep-scan
   bybitBaseUrl: string;
   executeTrades: boolean; // false = paper mode (decide + record, never send an order)
   minConfidence: number; // skip BUY/SELL below this
@@ -35,9 +39,9 @@ function bool(v: string | undefined, def: boolean): boolean {
 }
 
 export function loadConfig(env: TraderEnv): TradingConfig {
-  const quoteCoin = env.QUOTE_COIN?.trim() || "USDC";
-  const symbol = env.TRADING_SYMBOL?.trim() || "BTCUSDC";
-  const universe = (env.UNIVERSE?.trim() || `${symbol},ETHUSDC,SOLUSDC,XRPUSDC`)
+  const quoteCoin = env.QUOTE_COIN?.trim() || "USDT";
+  const symbol = env.TRADING_SYMBOL?.trim() || "BTCUSDT";
+  const universe = (env.UNIVERSE?.trim() || "")
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
@@ -45,6 +49,10 @@ export function loadConfig(env: TraderEnv): TradingConfig {
     symbol,
     universe: [...new Set(universe)],
     quoteCoin,
+    minTurnover: num(env.MIN_TURNOVER, 5_000_000), // $5M/24h
+    maxChg24h: num(env.MAX_CHG24H, 35),
+    maxSpreadPct: num(env.MAX_SPREAD_PCT, 0.3),
+    screenTopN: Math.max(1, Math.min(20, num(env.SCREEN_TOP_N, 15))),
     bybitBaseUrl: env.BYBIT_BASE_URL?.trim() || "https://api-demo.bybit.com",
     executeTrades: bool(env.EXECUTE_TRADES, true),
     minConfidence: num(env.MIN_CONFIDENCE, 65),

@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gte, isNull, lt, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
-import { analyses, botSettings, marketMemory, trades, usageCounters } from "../db/schema";
+import { analyses, botSettings, equitySnapshots, marketMemory, trades, usageCounters } from "../db/schema";
 import { logger } from "./logger";
 import type { Decision } from "./types";
 
@@ -148,6 +148,23 @@ export async function setAnalysisOutcome(
     .where(eq(analyses.id, id));
 }
 
+/** Win-rate stats across ALL symbols (last `limit` evaluated, executed analyses). */
+export async function getPerformanceAll(db: DB, limit = 100): Promise<{ wins: number; losses: number; avgPnlPct: number }> {
+  const rows = await db
+    .select({ correct: analyses.outcomeCorrect, pnl: analyses.outcomePnlPct })
+    .from(analyses)
+    .where(and(eq(analyses.executed, 1), sql`${analyses.outcomeCorrect} IS NOT NULL`))
+    .orderBy(desc(analyses.ts))
+    .limit(limit);
+  let wins = 0, losses = 0, pnlSum = 0;
+  for (const r of rows) {
+    if (r.correct === 1) wins++;
+    else losses++;
+    pnlSum += r.pnl ?? 0;
+  }
+  return { wins, losses, avgPnlPct: rows.length ? pnlSum / rows.length : 0 };
+}
+
 /** Win-rate stats over the last `limit` evaluated, executed analyses for a symbol. */
 export async function getPerformance(db: DB, symbol: string, limit = 100): Promise<{ wins: number; losses: number; avgPnlPct: number }> {
   const rows = await db
@@ -276,6 +293,31 @@ export async function getRealizedPnlToday(db: DB): Promise<number> {
     .from(trades)
     .where(and(eq(trades.status, "closed"), gte(trades.closedAt, start.getTime())));
   return rows.reduce((a, r) => a + (r.pnl ?? 0), 0);
+}
+
+// ── Hourly portfolio-value snapshots (USD) ────────────────────────────────────
+
+const SNAPSHOT_GAP_MS = 10 * 60_000; // every ~10 min → the chart fills in fast & smoothly
+
+/** Record total portfolio value (USD) at most once per hour. Returns true if recorded. */
+export async function recordEquityIfDue(db: DB, equityUsd: number, breakdown: { coin: string; usd: number }[]): Promise<boolean> {
+  const last = await db.select({ ts: equitySnapshots.ts }).from(equitySnapshots).orderBy(desc(equitySnapshots.ts)).limit(1);
+  const now = Date.now();
+  if (last[0] && now - last[0].ts < SNAPSHOT_GAP_MS) return false;
+  await db.insert(equitySnapshots).values({ ts: now, equityUsd, breakdown: JSON.stringify(breakdown) });
+  log.info("equity.snapshot", { equityUsd: Math.round(equityUsd) });
+  return true;
+}
+
+export interface EquityPoint {
+  ts: number;
+  equityUsd: number;
+}
+
+/** Hourly equity history, oldest→newest, capped to `limit` most recent points. */
+export async function getEquityHistory(db: DB, limit = 720): Promise<EquityPoint[]> {
+  const rows = await db.select({ ts: equitySnapshots.ts, equityUsd: equitySnapshots.equityUsd }).from(equitySnapshots).orderBy(desc(equitySnapshots.ts)).limit(limit);
+  return rows.map((r) => ({ ts: r.ts, equityUsd: r.equityUsd })).reverse();
 }
 
 // ── Bot on/off + halt state ──────────────────────────────────────────────────

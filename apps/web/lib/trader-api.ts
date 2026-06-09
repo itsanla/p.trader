@@ -60,6 +60,16 @@ export interface Status {
   recentAnalyses: Analysis[];
 }
 
+export interface EquityPoint {
+  ts: number;
+  equityUsd: number;
+}
+
+export interface EquityData {
+  current: { totalUsd: number; coins: { coin: string; usd: number; balance: number }[] } | null;
+  history: EquityPoint[];
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
@@ -69,6 +79,7 @@ async function get<T>(path: string): Promise<T> {
 export const fetchWallet = () => get<Wallet>("/wallet");
 export const fetchBot = () => get<BotInfo>("/bot");
 export const fetchStatus = () => get<Status>("/status");
+export const fetchEquity = () => get<EquityData>("/equity");
 
 export async function toggleBot(enabled: boolean): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch(`${API_BASE}/bot`, {

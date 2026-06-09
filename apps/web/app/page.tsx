@@ -3,31 +3,35 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   fetchBot,
+  fetchEquity,
   fetchStatus,
-  fetchWallet,
   getAdminSecret,
   setAdminSecret,
   toggleBot,
   type BotInfo,
+  type EquityData,
+  type EquityPoint,
   type Status,
-  type Wallet,
 } from "@/lib/trader-api";
 
-const POLL_MS = 15_000;
+const POLL_MS = 20_000;
 
-function fmt(n: number, d = 2): string {
-  return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+function usd(n: number): string {
+  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function signed(n: number): string {
+  return (n >= 0 ? "+" : "−") + usd(Math.abs(n)).slice(1);
 }
 function ago(ts: number): string {
   const s = Math.round((Date.now() - ts) / 1000);
-  if (s < 60) return `${s}d lalu`;
-  if (s < 3600) return `${Math.round(s / 60)}m lalu`;
-  if (s < 86400) return `${Math.round(s / 3600)}j lalu`;
-  return `${Math.round(s / 86400)}h lalu`;
+  if (s < 60) return `${s} dtk lalu`;
+  if (s < 3600) return `${Math.round(s / 60)} mnt lalu`;
+  if (s < 86400) return `${Math.round(s / 3600)} jam lalu`;
+  return `${Math.round(s / 86400)} hari lalu`;
 }
 
 export default function Dashboard() {
-  const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [eq, setEq] = useState<EquityData | null>(null);
   const [bot, setBot] = useState<BotInfo | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,13 +40,13 @@ export default function Dashboard() {
 
   const load = useCallback(async () => {
     try {
-      const [w, b, s] = await Promise.all([fetchWallet().catch(() => null), fetchBot(), fetchStatus()]);
-      if (w) setWallet(w);
+      const [e, b, s] = await Promise.all([fetchEquity(), fetchBot(), fetchStatus()]);
+      setEq(e);
       setBot(b);
       setStatus(s);
       setError(null);
     } catch {
-      setError("Gagal memuat data dari API. Cek NEXT_PUBLIC_API_URL.");
+      setError("Gagal memuat data. Cek NEXT_PUBLIC_API_URL.");
     }
   }, []);
 
@@ -62,182 +66,188 @@ export default function Dashboard() {
     setBusy(true);
     const res = await toggleBot(!bot.enabled);
     setBusy(false);
-    if (!res.ok) {
-      setError(res.error ?? "Gagal mengubah status bot.");
-      return;
-    }
+    if (!res.ok) return setError(res.error ?? "Gagal mengubah bot.");
     setError(null);
     await load();
   }
 
   const enabled = bot?.enabled ?? false;
-  const halted = bot?.haltedDate != null;
+  const history = eq?.history ?? [];
+  const latest = eq?.current?.totalUsd ?? history[history.length - 1]?.equityUsd ?? 0;
+
+  // Untung/rugi = perubahan TOTAL KEKAYAAN (termasuk koin yang sedang dipegang).
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const todayBase = history.find((p) => p.ts >= startToday.getTime())?.equityUsd ?? history[0]?.equityUsd ?? latest;
+  const totalBase = history[0]?.equityUsd ?? latest;
+  const todayChange = latest - todayBase;
+  const totalChange = latest - totalBase;
+  const pct = (chg: number, base: number) => (base > 0 ? (chg / base) * 100 : 0);
 
   return (
-    <div className="space-y-6">
-      <header className="flex items-center justify-between">
-        <div>
-          <div className="eyebrow">AI Crypto Agent</div>
-          <h1 className="title-display">Trader Dashboard</h1>
+    <div className="space-y-5">
+      {/* Hero: total wealth + bot switch */}
+      <section className="surface-card p-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-sm text-muted">Total Kekayaan (semua koin)</div>
+            <div className="text-4xl font-bold tracking-tight" style={{ marginTop: 4 }}>
+              {eq ? usd(latest) : "…"}
+            </div>
+            <div className="mt-1 text-xs text-muted">dalam USD — nilai stabil (sengaja tidak dikonversi ke Rupiah agar tidak menyesatkan)</div>
+          </div>
+          <button type="button" onClick={onToggle} disabled={busy || !bot} className={enabled ? "btn-secondary" : "btn-primary"} style={{ minWidth: 130 }}>
+            {busy ? "…" : enabled ? "■ Matikan Bot" : "▶ Nyalakan Bot"}
+          </button>
         </div>
-        <span className={`chip ${enabled ? "accent" : ""}`}>{enabled ? "🟢 BOT AKTIF" : "🔴 BOT MATI"}</span>
-      </header>
+        <div className="mt-2">
+          <span className={`chip ${enabled ? "accent" : ""}`}>{enabled ? "🟢 Bot menyala — sedang berdagang" : "🔴 Bot mati — tidak berdagang"}</span>
+          {bot?.haltedDate && <span className="ml-2 text-xs" style={{ color: "var(--accent-2)" }}>kill-switch aktif hari ini</span>}
+        </div>
+      </section>
 
       {error && <p className="alert">{error}</p>}
 
-      {/* Wallet summary */}
+      {/* Untung / Rugi */}
+      <div className="grid grid-cols-2 gap-4">
+        <PnL label="Untung / Rugi — Hari Ini" change={todayChange} pct={pct(todayChange, todayBase)} ready={history.length > 0} />
+        <PnL label="Untung / Rugi — Total" change={totalChange} pct={pct(totalChange, totalBase)} ready={history.length > 1} />
+      </div>
+
+      {/* Chart */}
       <section className="surface-card p-6">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Ringkasan Wallet</h2>
-          <span className="text-xs text-muted">demo · {wallet?.quoteCoin ?? "USDC"}</span>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-base font-semibold">📈 Perubahan Kekayaan (per jam)</h2>
+          <span className="text-xs text-muted">{history.length} titik tercatat</span>
         </div>
-        {wallet ? (
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            <Stat label="Total Ekuitas" value={`${fmt(wallet.totalEquityQuote)} ${wallet.quoteCoin}`} big />
-            <Stat label={`Saldo ${wallet.quoteCoin}`} value={fmt(wallet.quote)} />
-            <Stat
-              label="PnL Hari Ini"
-              value={`${(bot?.realizedPnlToday ?? 0) >= 0 ? "+" : ""}${fmt(bot?.realizedPnlToday ?? 0)}`}
-              tone={(bot?.realizedPnlToday ?? 0) >= 0 ? "pos" : "neg"}
-            />
-            <Stat label="Aset" value={`${Object.values(wallet.coins).filter((v) => v > 0).length} koin`} />
+        <EquityChart points={history} />
+      </section>
+
+      {/* Rincian koin */}
+      <section className="surface-card p-6">
+        <h2 className="mb-3 text-base font-semibold">Rincian Koin (nilai USD)</h2>
+        {eq?.current ? (
+          <div className="space-y-2">
+            {eq.current.coins.map((c) => (
+              <div key={c.coin} className="flex items-center justify-between border-b border-[color:var(--border)] pb-2 text-sm">
+                <div>
+                  <span className="font-medium">{c.coin}</span>
+                  <span className="ml-2 text-muted">{c.balance.toLocaleString("en-US", { maximumFractionDigits: 6 })}</span>
+                </div>
+                <div className="font-semibold">{usd(c.usd)}</div>
+              </div>
+            ))}
+            {eq.current.coins.length === 0 && <p className="text-sm text-muted">Belum ada koin.</p>}
           </div>
         ) : (
           <p className="text-sm text-muted">Memuat saldo…</p>
         )}
-        {wallet && (
-          <div className="mt-4 flex flex-wrap gap-2">
-            {Object.entries(wallet.coins)
-              .filter(([, v]) => v > 0)
-              .map(([coin, v]) => (
-                <span key={coin} className="chip">
-                  {coin}: {fmt(v, coin === wallet.quoteCoin ? 2 : 6)}
-                </span>
-              ))}
+      </section>
+
+      {/* Aktivitas (bahasa sederhana) */}
+      <section className="surface-card p-6">
+        <h2 className="mb-3 text-base font-semibold">Aktivitas Bot</h2>
+        {status && status.openTrades.length > 0 && (
+          <div className="mb-3">
+            <div className="mb-1 text-xs uppercase tracking-wide text-muted">Sedang dipegang</div>
+            {status.openTrades.map((t) => (
+              <div key={t.id} className="text-sm">
+                🟢 <span className="font-medium">{t.symbol.replace(/USDT$|USDC$/, "")}</span> — beli {t.qty.toLocaleString("en-US", { maximumFractionDigits: 4 })} di {usd(t.price)}
+              </div>
+            ))}
           </div>
+        )}
+        <div className="mb-1 text-xs uppercase tracking-wide text-muted">Keputusan terbaru</div>
+        {status && status.recentAnalyses.length > 0 ? (
+          <ul className="space-y-1 text-sm">
+            {status.recentAnalyses.slice(0, 8).map((a) => {
+              const name = a.symbol.replace(/USDT$|USDC$/, "");
+              const label = a.action === "BUY" ? `🟢 Beli ${name}` : a.action === "SELL" ? `🔴 Jual ${name}` : `⚪ Tahan (belum ada peluang bagus)`;
+              return (
+                <li key={a.id} className="flex items-center justify-between">
+                  <span>
+                    {label}
+                    {a.action !== "HOLD" && a.executed === 1 && <span className="ml-1 text-[color:var(--accent)]">✓</span>}
+                    {a.outcomePnlPct != null && (
+                      <span className={a.outcomePnlPct >= 0 ? "ml-2" : "ml-2"} style={{ color: a.outcomePnlPct >= 0 ? "var(--accent)" : "var(--accent-2)" }}>
+                        ({a.outcomePnlPct >= 0 ? "untung" : "rugi"} {Math.abs(a.outcomePnlPct).toFixed(1)}%)
+                      </span>
+                    )}
+                  </span>
+                  <span className="text-xs text-muted">{ago(a.ts)}</span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p className="text-sm text-muted">Belum ada aktivitas.</p>
         )}
       </section>
 
-      {/* Bot control */}
-      <section className="surface-card p-6">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-lg font-semibold">Kontrol Bot</h2>
-            <p className="mt-1 text-sm text-muted">
-              {enabled
-                ? "Bot sedang memindai pasar tiap menit dan boleh membuka posisi."
-                : "Bot dimatikan — tidak ada perdagangan sama sekali."}
-              {halted && <span className="text-[color:var(--accent-2)]"> · kill-switch aktif hari ini</span>}
-            </p>
-            {bot && (
-              <p className="mt-2 text-xs text-muted">
-                Universe: {bot.config.universe.join(", ")} · risk {bot.config.riskPct}% · R:R≥{bot.config.minRR} · kill-switch {bot.config.killSwitchPct}% ·
-                {bot.config.debateEnabled ? " debat ON" : " debat OFF"} ·{bot.config.executeTrades ? " LIVE" : " PAPER"}
-              </p>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={onToggle}
-            disabled={busy || !bot}
-            className={enabled ? "btn-secondary" : "btn-primary"}
-            style={{ minWidth: 140 }}
-          >
-            {busy ? "…" : enabled ? "Matikan Bot" : "Nyalakan Bot"}
-          </button>
-        </div>
-        <div className="mt-4 flex flex-wrap items-center gap-2">
-          <input
-            type="password"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            onBlur={() => setAdminSecret(secret.trim())}
-            placeholder="Secret admin (untuk kontrol)"
-            className="input-field"
-            style={{ maxWidth: 280 }}
-          />
+      {/* Kontrol secret */}
+      <section className="surface-card p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted">Secret admin (untuk nyala/matikan bot):</span>
+          <input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} onBlur={() => setAdminSecret(secret.trim())} placeholder="secret" className="input-field" style={{ maxWidth: 220 }} />
           <button type="button" className="btn-secondary" onClick={() => setAdminSecret(secret.trim())}>
             Simpan
           </button>
         </div>
       </section>
-
-      {/* Open positions */}
-      <section className="surface-card p-6">
-        <h2 className="mb-3 text-lg font-semibold">Posisi Terbuka</h2>
-        {status && status.openTrades.length > 0 ? (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-left text-xs uppercase tracking-wide text-muted">
-                <tr>
-                  <th className="py-2">Pasangan</th>
-                  <th>Arah</th>
-                  <th>Qty</th>
-                  <th>Entry</th>
-                  <th>Stop</th>
-                  <th>Target</th>
-                </tr>
-              </thead>
-              <tbody>
-                {status.openTrades.map((t) => (
-                  <tr key={t.id} className="border-t border-[color:var(--border)]">
-                    <td className="py-2 font-medium">{t.symbol}</td>
-                    <td>{t.side}</td>
-                    <td>{fmt(t.qty, 6)}</td>
-                    <td>{fmt(t.price)}</td>
-                    <td>{t.stopLoss ? fmt(t.stopLoss) : "—"}</td>
-                    <td>{t.takeProfit ? fmt(t.takeProfit) : "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <p className="text-sm text-muted">Tidak ada posisi terbuka.</p>
-        )}
-      </section>
-
-      {/* Recent decisions */}
-      <section className="surface-card p-6">
-        <h2 className="mb-3 text-lg font-semibold">Keputusan Terbaru</h2>
-        {status && status.recentAnalyses.length > 0 ? (
-          <ul className="space-y-2">
-            {status.recentAnalyses.map((a) => (
-              <li key={a.id} className="flex items-start justify-between gap-3 border-t border-[color:var(--border)] py-2 text-sm">
-                <div>
-                  <span className={`chip ${a.action === "BUY" ? "accent" : ""}`}>{a.action}</span>
-                  <span className="ml-2 font-medium">{a.symbol}</span>
-                  <span className="ml-2 text-muted">conf {a.confidence}</span>
-                  {a.executed === 1 && <span className="ml-2 text-[color:var(--accent)]">✓ eksekusi</span>}
-                  <p className="mt-1 text-xs text-muted">{a.reasoning?.slice(0, 140)}</p>
-                </div>
-                <div className="shrink-0 text-right text-xs text-muted">
-                  {ago(a.ts)}
-                  {a.outcomePnlPct != null && (
-                    <div className={a.outcomeCorrect ? "text-[color:var(--accent)]" : "text-[color:var(--accent-2)]"}>
-                      {a.outcomePnlPct >= 0 ? "+" : ""}
-                      {fmt(a.outcomePnlPct)}%
-                    </div>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-sm text-muted">Belum ada keputusan.</p>
-        )}
-      </section>
     </div>
   );
 }
 
-function Stat({ label, value, big, tone }: { label: string; value: string; big?: boolean; tone?: "pos" | "neg" }) {
-  const color = tone === "pos" ? "var(--accent)" : tone === "neg" ? "var(--accent-2)" : "var(--foreground)";
+function PnL({ label, change, pct, ready }: { label: string; change: number; pct: number; ready: boolean }) {
+  const pos = change >= 0;
+  const color = pos ? "var(--accent)" : "var(--accent-2)";
+  return (
+    <div className="surface-card p-5">
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      {ready ? (
+        <>
+          <div className="text-2xl font-bold" style={{ color, marginTop: 4 }}>
+            {signed(change)}
+          </div>
+          <div className="text-sm" style={{ color }}>
+            {pos ? "▲" : "▼"} {Math.abs(pct).toFixed(2)}%
+          </div>
+        </>
+      ) : (
+        <div className="mt-2 text-sm text-muted">Mengumpulkan data…</div>
+      )}
+    </div>
+  );
+}
+
+function EquityChart({ points }: { points: EquityPoint[] }) {
+  if (points.length < 2) {
+    return <p className="py-8 text-center text-sm text-muted">Grafik muncul setelah beberapa jam data terkumpul (snapshot diambil tiap jam).</p>;
+  }
+  const w = 720;
+  const h = 200;
+  const pad = 10;
+  const xs = points.map((p) => p.ts);
+  const ys = points.map((p) => p.equityUsd);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const X = (t: number) => pad + ((t - minX) / (maxX - minX || 1)) * (w - 2 * pad);
+  const Y = (v: number) => pad + (1 - (v - minY) / (maxY - minY || 1)) * (h - 2 * pad);
+  const line = points.map((p, i) => `${i === 0 ? "M" : "L"}${X(p.ts).toFixed(1)},${Y(p.equityUsd).toFixed(1)}`).join(" ");
+  const up = ys[ys.length - 1] >= ys[0];
+  const color = up ? "var(--accent)" : "var(--accent-2)";
+  const area = `${line} L${X(maxX).toFixed(1)},${(h - pad).toFixed(1)} L${X(minX).toFixed(1)},${(h - pad).toFixed(1)} Z`;
   return (
     <div>
-      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
-      <div className={big ? "text-2xl font-bold" : "text-lg font-semibold"} style={{ color }}>
-        {value}
+      <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="w-full" style={{ height: 200 }}>
+        <path d={area} fill={color} opacity={0.12} />
+        <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+      </svg>
+      <div className="mt-1 flex justify-between text-xs text-muted">
+        <span>{new Date(minX).toLocaleString("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+        <span>{new Date(maxX).toLocaleString("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
       </div>
     </div>
   );

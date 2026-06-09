@@ -35,6 +35,16 @@ export interface OrderResult {
   error?: string;
 }
 
+/** Raw spot ticker row from /v5/market/tickers (all fields are strings). */
+export interface RawTicker {
+  symbol: string;
+  lastPrice: string;
+  bid1Price: string;
+  ask1Price: string;
+  turnover24h: string;
+  price24hPcnt: string;
+}
+
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -119,6 +129,13 @@ export class Bybit {
     return { last: last || mid, bid, ask, spreadPct };
   }
 
+  /** ALL spot tickers in ONE call — the cheap broad screen across hundreds of pairs. */
+  async getAllTickers(): Promise<RawTicker[]> {
+    const qs = new URLSearchParams({ category: this.category }).toString();
+    const data = await this.publicGet<{ list: RawTicker[] }>("/v5/market/tickers", qs);
+    return data.list ?? [];
+  }
+
   async getInstrumentRules(symbol: string): Promise<InstrumentRules> {
     const qs = new URLSearchParams({ category: this.category, symbol }).toString();
     const data = await this.publicGet<{
@@ -139,15 +156,19 @@ export class Bybit {
   async getWalletBalance(): Promise<Wallet> {
     const qs = new URLSearchParams({ accountType: "UNIFIED" }).toString();
     const data = await this.signedGet<{
-      list: { totalEquity: string; coin: { coin: string; walletBalance: string }[] }[];
+      list: { totalEquity: string; coin: { coin: string; walletBalance: string; usdValue: string }[] }[];
     }>("/v5/account/wallet-balance", qs);
     const acct = data.list?.[0];
     const coins: Record<string, number> = {};
-    for (const c of acct?.coin ?? []) coins[c.coin] = Number(c.walletBalance);
+    const coinsUsd: Record<string, number> = {};
+    for (const c of acct?.coin ?? []) {
+      coins[c.coin] = Number(c.walletBalance);
+      coinsUsd[c.coin] = Number(c.usdValue) || 0;
+    }
     const quote = coins[this.quoteCoin] ?? 0;
     const totalEquityQuote = Number(acct?.totalEquity ?? "0") || quote;
     log.info("wallet", { quote, equity: totalEquityQuote, coins: Object.keys(coins).length });
-    return { coins, quote, totalEquityQuote };
+    return { coins, coinsUsd, quote, totalEquityQuote };
   }
 
   // ── Trading (signed) ──────────────────────────────────────────────────────────

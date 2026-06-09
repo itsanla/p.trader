@@ -1,14 +1,14 @@
-import { runDecision } from "./analysis";
+import { runSelection, type SelectionCandidate } from "./analysis";
 import { floorToStep } from "./bybit";
 import type { Ctx } from "./context";
-import { runDebate } from "./debate";
 import {
   closeTrade,
   getAllOpenTrades,
   getBotState,
   getOpenHeatQuote,
-  getPerformance,
+  getPerformanceAll,
   getRealizedPnlToday,
+  recordEquityIfDue,
   getUnevaluatedAnalyses,
   insertAnalysis,
   insertTrade,
@@ -19,14 +19,12 @@ import {
 import { computeIndicators } from "./indicators";
 import { logger } from "./logger";
 import { killSwitchTripped, longStop, longTarget, roundTripCostFrac, sizeLong, tradeCostQuote } from "./risk";
-import { buildSignal, detectRegime, rankCandidates } from "./strategy";
-import { evaluateRoute } from "./triggers";
+import { screenMarket } from "./screener";
+import { detectRegime } from "./strategy";
 import type { Decision, MarketSnapshot, Wallet } from "./types";
-import { buildFingerprint, searchSimilar, storeMemory } from "./vector";
+import { buildFingerprint, storeMemory } from "./vector";
 
 const log = logger("trader");
-
-const MIN_ENTRY_STRENGTH = 55; // rule-based conviction needed before consulting the LLM
 
 export interface CycleResult {
   ran: boolean;
@@ -44,19 +42,26 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function buildSnapshot(ctx: Ctx, symbol: string): Promise<MarketSnapshot | null> {
+// `seed` (price + spread from the screener's bulk ticker call) lets us skip a per-symbol
+// ticker request, keeping the deep scan within the subrequest budget.
+async function buildSnapshot(ctx: Ctx, symbol: string, seed?: { price: number; spreadPct: number }): Promise<MarketSnapshot | null> {
   try {
-    const [c1h, c4h, c1d, ticker] = await Promise.all([
+    const [c1h, c4h, c1d] = await Promise.all([
       ctx.bybit.getKline(symbol, "1h", 200),
       ctx.bybit.getKline(symbol, "4h", 120),
       ctx.bybit.getKline(symbol, "1d", 90),
-      ctx.bybit.getTicker(symbol),
     ]);
     if (!c1h.length) return null;
+    let px: { price: number; spreadPct: number };
+    if (seed) px = seed;
+    else {
+      const t = await ctx.bybit.getTicker(symbol);
+      px = { price: t.last, spreadPct: t.spreadPct };
+    }
     return {
       symbol,
-      price: ticker.last || c1h[c1h.length - 1].close,
-      spreadPct: ticker.spreadPct,
+      price: px.price || c1h[c1h.length - 1].close,
+      spreadPct: px.spreadPct,
       tf1h: computeIndicators(c1h),
       tf4h: computeIndicators(c4h),
       tf1d: computeIndicators(c1d),
@@ -89,6 +94,14 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
     return { ran: false, note: "wallet unavailable" };
   }
   const equity = wallet.totalEquityQuote;
+  // Hourly wealth snapshot (USD — a stable unit) for the dashboard chart.
+  await recordEquityIfDue(
+    db,
+    equity,
+    Object.entries(wallet.coinsUsd)
+      .filter(([, usd]) => usd > 0.01)
+      .map(([coin, usd]) => ({ coin, usd })),
+  ).catch(() => {});
   const today = todayStr();
   if (bot.haltedDate === today) return { ran: false, note: "halted hari ini (kill-switch)" };
   const realized = await getRealizedPnlToday(db);
@@ -98,19 +111,27 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
     return { ran: false, note: `kill-switch aktif (rugi hari ini ${realized.toFixed(2)})` };
   }
 
-  // 2. Scan the universe (rule-based, zero tokens).
-  const snaps = (await Promise.all(cfg.universe.map((s) => buildSnapshot(ctx, s)))).filter((s): s is MarketSnapshot => s != null);
-  const snapBySymbol = new Map(snaps.map((s) => [s.symbol, s]));
+  // 2. Screen the WHOLE market in one call → deep-scan the momentum leaders + held coins.
+  const screened = await screenMarket(ctx.bybit, cfg).catch((err) => {
+    log.error("screen.failed", { err: err instanceof Error ? err.message : String(err) });
+    return [];
+  });
   const openTrades = await getAllOpenTrades(db);
   const openSymbols = new Set(openTrades.map((t) => t.symbol));
+  const seedBySymbol = new Map(screened.map((c) => [c.symbol, c]));
 
-  // Rich per-symbol scan summary so the 2-hour demo is fully auditable in the logs.
-  for (const s of snaps) {
-    const sig = buildSignal(s);
-    log.info("scan", { sym: s.symbol, price: s.price, regime: sig.regime, bias: sig.bias, strength: Math.round(sig.strength), rsi1h: +s.tf1h.rsi14.toFixed(1), adx4h: +s.tf4h.adx14.toFixed(1) });
+  const toScan = [...new Set([...screened.map((c) => c.symbol), ...openSymbols])];
+  const snaps = (
+    await Promise.all(toScan.map((s) => buildSnapshot(ctx, s, seedBySymbol.has(s) ? { price: seedBySymbol.get(s)!.price, spreadPct: seedBySymbol.get(s)!.spreadPct } : undefined)))
+  ).filter((s): s is MarketSnapshot => s != null);
+  const snapBySymbol = new Map(snaps.map((s) => [s.symbol, s]));
+
+  for (const c of screened.slice(0, 8)) {
+    const s = snapBySymbol.get(c.symbol);
+    if (s) log.info("scan", { sym: c.symbol, chg24h: +c.chg24h.toFixed(1), regime: detectRegime(s), rsi1h: +s.tf1h.rsi14.toFixed(1), adx4h: +s.tf4h.adx14.toFixed(1), volX: s.tf1h.volumeSma20 > 0 ? +(s.tf1h.volume / s.tf1h.volumeSma20).toFixed(1) : 0 });
   }
 
-  // 3. EXIT pass — protective exits are rule-based (fast, deterministic, no LLM).
+  // 3. EXIT pass (rule-based, fast, no LLM).
   let exits = 0;
   for (const t of openTrades) {
     const snap = snapBySymbol.get(t.symbol);
@@ -123,30 +144,34 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
     }
   }
 
-  // 4. ENTRY pass — at most one new position per cycle, only if we have room.
+  // 4. ENTRY pass — the AI picks the best BUY from the long-eligible momentum leaders.
   let entry: CycleResult = { ran: true, scanned: snaps.length, exits };
   if (openTrades.length - exits < cfg.maxOpenPositions) {
-    const candidates = rankCandidates(snaps).filter((c) => c.signal.bias === "long" && c.score > 0 && !openSymbols.has(c.symbol));
-    const best = candidates[0];
-    if (best && best.signal.strength >= MIN_ENTRY_STRENGTH) {
-      const route = evaluateRoute(best.snapshot, best.signal, {
-        hasPosition: false,
-        positionAtRisk: false,
-        debateEnabled: cfg.debateEnabled,
-        minStrength: MIN_ENTRY_STRENGTH,
-      });
-      log.info("entry.route", { sym: best.symbol, route: route.route, abnormal: route.abnormal, strength: Math.round(best.signal.strength), reasons: route.reasons.join("; ") });
-      if (route.route !== "none") {
-        entry = { ...entry, ...(await considerEntry(ctx, best.snapshot, route.route, route.reasons, equity, wallet, await getOpenHeatQuote(db))) };
-      }
+    const shortlist = screened
+      .filter((c) => !openSymbols.has(c.symbol))
+      .map((c) => ({ symbol: c.symbol, snapshot: snapBySymbol.get(c.symbol), chg24h: c.chg24h }))
+      .filter((c): c is { symbol: string; snapshot: MarketSnapshot; chg24h: number } => c.snapshot != null && isLongEligible(c.snapshot))
+      .slice(0, 12);
+
+    if (shortlist.length > 0) {
+      entry = { ...entry, ...(await selectAndEnter(ctx, shortlist, equity, wallet, await getOpenHeatQuote(db))) };
     } else {
-      log.info("entry.skip", { reason: best ? `kandidat terbaik ${best.symbol} strength ${Math.round(best.signal.strength)} < ${MIN_ENTRY_STRENGTH}` : "tak ada kandidat long (regime tak mendukung)" });
+      log.info("entry.skip", { reason: "tak ada momentum leader yang long-eligible" });
     }
   } else {
     log.info("entry.skip", { reason: `posisi penuh (${cfg.maxOpenPositions})` });
   }
-  log.info("cycle.done", { scanned: snaps.length, exits, action: entry.action, executed: entry.executed, route: entry.route, note: entry.note });
+  log.info("cycle.done", { screened: screened.length, scanned: snaps.length, exits, action: entry.action, executed: entry.executed, note: entry.note });
   return entry;
+}
+
+/** A momentum leader is tradeable-long if it's not clearly downtrending or blown-off. */
+function isLongEligible(s: MarketSnapshot): boolean {
+  const h = s.tf1h;
+  if (detectRegime(s) === "trend_down") return false;
+  if (h.price < h.ema200) return false; // below long-term mean → not a leader
+  if (h.rsi14 >= 80) return false; // blow-off top → chasing risk
+  return true;
 }
 
 /** Rule-based exit check for an open long. */
@@ -174,27 +199,28 @@ async function executeExit(ctx: Ctx, snap: MarketSnapshot, t: OpenTrade, reason:
   await storeMemory(ctx, t.symbol, `${t.symbol} | EXIT (${reason}) @ ${snap.price} | PnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} quote`);
 }
 
-async function considerEntry(
-  ctx: Ctx,
-  snap: MarketSnapshot,
-  route: "normal" | "debate",
-  reasons: string[],
-  equity: number,
-  wallet: Wallet,
-  openHeat: number,
-): Promise<Partial<CycleResult>> {
-  const { db, cfg, bybit } = ctx;
-  const baseCoin = bybit.baseOf(snap.symbol);
+/** Let the AI pick the best BUY from the momentum shortlist, then risk-gate + execute it. */
+async function selectAndEnter(ctx: Ctx, shortlist: SelectionCandidate[], equity: number, wallet: Wallet, openHeat: number): Promise<Partial<CycleResult>> {
+  const { db } = ctx;
+  const performance = await getPerformanceAll(db, 100);
+  const sel = await runSelection(ctx, shortlist, wallet, performance);
+  log.info("entry.select", { pick: sel.pick ?? "HOLD", confidence: sel.confidence, candidates: shortlist.length });
+  if (!sel.pick) return { action: "HOLD", note: sel.reasoning.slice(0, 100) };
 
-  const [similar, performance] = await Promise.all([
-    searchSimilar(ctx, snap.symbol, buildFingerprint(snap)),
-    getPerformance(db, snap.symbol, 100),
-  ]);
+  const snap = shortlist.find((c) => c.symbol === sel.pick)?.snapshot;
+  if (!snap) return { action: "HOLD", note: "pick tak valid" };
 
-  const dctx = { snapshot: snap, wallet, baseCoin, openTrades: [], triggerReasons: reasons, similarMemories: similar, performance };
-  const out = route === "debate" ? await runDebate(ctx, dctx) : await runDecision(ctx, dctx);
-  const decision = out.decision;
-
+  const decision: Decision = {
+    action: "BUY",
+    confidence: sel.confidence,
+    timeframeBias: "bullish",
+    entryZone: null,
+    stopLoss: sel.stopLoss,
+    takeProfit: sel.takeProfit,
+    reasoning: sel.reasoning,
+    keyFactors: [],
+    invalidation: "",
+  };
   const exec = await maybeEnterLong(ctx, snap, decision, equity, wallet.quote, openHeat);
 
   const analysisId = crypto.randomUUID();
@@ -204,13 +230,12 @@ async function considerEntry(
     ts: Date.now(),
     price: snap.price,
     snapshot: snap,
-    trigger: `${route}: ${reasons.join("; ")}`,
+    trigger: `AI memilih dari ${shortlist.length} momentum leaders`,
     decision,
     executed: exec.executed,
-    keyUsed: out.keyUsed,
-    modelUsed: out.modelUsed,
+    keyUsed: sel.keyUsed,
+    modelUsed: sel.modelUsed,
   });
-
   if (exec.executed && exec.trade) {
     await insertTrade(db, {
       id: exec.trade.id,
@@ -226,9 +251,8 @@ async function considerEntry(
       error: exec.trade.error,
     });
   }
-  await storeMemory(ctx, snap.symbol, buildFingerprint(snap, { action: decision.action, confidence: decision.confidence }));
-
-  return { entrySymbol: snap.symbol, action: decision.action, confidence: decision.confidence, executed: exec.executed, route, note: exec.note };
+  await storeMemory(ctx, snap.symbol, buildFingerprint(snap, { action: "BUY", confidence: sel.confidence }));
+  return { entrySymbol: snap.symbol, action: "BUY", confidence: sel.confidence, executed: exec.executed, note: exec.note };
 }
 
 interface EnterOutcome {
@@ -249,7 +273,12 @@ async function maybeEnterLong(ctx: Ctx, snap: MarketSnapshot, decision: Decision
   // Prefer the model's stop if sane, else ATR-based; target honors min R:R.
   const atrStop = longStop(price, snap.tf1h.atr14, cfg.atrStopMult);
   const stop = decision.stopLoss && decision.stopLoss < price && decision.stopLoss > atrStop * 0.9 ? decision.stopLoss : atrStop;
-  const target = decision.takeProfit?.[0] && decision.takeProfit[0] > price ? decision.takeProfit[0] : longTarget(price, stop, cfg.minRR, cfg, snap.spreadPct);
+  // The AI sets the STOP (defines risk); the SYSTEM sets the TARGET to enforce the minimum
+  // R:R after costs. Honor the AI's take-profit only when it's MORE ambitious than that floor —
+  // otherwise a tight AI target would fail the R:R gate and we'd never trade momentum.
+  const sysTarget = longTarget(price, stop, cfg.minRR, cfg, snap.spreadPct);
+  const aiTP = decision.takeProfit?.[0];
+  const target = aiTP && aiTP > sysTarget ? aiTP : sysTarget;
 
   const sized = sizeLong({ cfg, equity, quoteAvailable, price, stop, target, openHeatQuote: openHeat, spreadPct: snap.spreadPct });
   if (sized.qty <= 0) return { executed: false, note: sized.reasons.join("; ") || "size 0", stop, target };

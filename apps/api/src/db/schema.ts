@@ -56,6 +56,14 @@ export const marketMemory = sqliteTable("market_memory", {
   createdAt: int("created_at").notNull(),
 });
 
+// ── Hourly portfolio value snapshots (in USD — a stable unit) ─────────────────
+export const equitySnapshots = sqliteTable("equity_snapshots", {
+  id: int().primaryKey({ autoIncrement: true }),
+  ts: int().notNull(), // epoch ms
+  equityUsd: real("equity_usd").notNull(), // total value of ALL coins in USD
+  breakdown: text(), // JSON [{coin, usd}]
+});
+
 // ── Bot on/off + halt state (single row id='global') ──────────────────────────
 export const botSettings = sqliteTable("bot_settings", {
   id: text().primaryKey(), // 'global'

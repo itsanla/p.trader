@@ -149,6 +149,65 @@ export async function runDecision(ctx: Ctx, dctx: DecisionContext): Promise<Deci
   return { decision, keyUsed, modelUsed, samples: results.length };
 }
 
+// ── Proactive selection: let the AI pick the best BUY from the momentum shortlist ──
+
+export const selectionSchema = z.object({
+  pick: z.string().describe("Simbol koin terbaik untuk BUY sekarang (mis. SOLUSDT), atau 'HOLD' jika benar-benar tak ada setup layak."),
+  confidence: z.number().describe("Keyakinan 0-100 pada pilihan."),
+  stopLoss: z.number().nullable().describe("Harga stop-loss untuk koin yang dipilih (WAJIB jika BUY)."),
+  takeProfit: z.array(z.number()).nullable().describe("Target take-profit, atau null."),
+  reasoning: z.string().describe("Alasan ringkas berbasis data (tren, momentum, volume, R:R)."),
+});
+
+export interface SelectionCandidate {
+  symbol: string;
+  snapshot: MarketSnapshot;
+  chg24h: number;
+}
+
+export interface SelectionOutput {
+  pick: string | null; // chosen symbol, or null for HOLD
+  confidence: number;
+  stopLoss: number | null;
+  takeProfit: number[] | null;
+  reasoning: string;
+  keyUsed: string;
+  modelUsed: string;
+}
+
+const SELECT_SYSTEM = `Kamu trader momentum kripto yang PROAKTIF dan disiplin pada data. Tujuanmu PROFIT, bukan menahan modal.
+Dari daftar koin TERKUAT (pemimpin momentum) berikut, pilih SATU yang paling layak di-BUY sekarang berdasarkan konfluensi: tren naik (EMA tersusun), momentum (RSI 45-70 & MACD positif), dan konfirmasi volume.
+Pilih 'HOLD' HANYA jika benar-benar tak ada yang punya setup bersih (mis. semua overbought ekstrem RSI>78, atau tak ada konfirmasi sama sekali). Default-mu adalah BERTINDAK bila ada peluang wajar.
+Wajib sertakan stop_loss yang masuk akal (berbasis struktur/ATR). Jawab hanya sesuai skema.`;
+
+/** Ask the LLM to pick the single best BUY among the screened momentum leaders. */
+export async function runSelection(ctx: Ctx, candidates: SelectionCandidate[], wallet: Wallet, performance: { wins: number; losses: number; avgPnlPct: number }): Promise<SelectionOutput> {
+  const lines = candidates.map((c) => {
+    const h = c.snapshot.tf1h;
+    const trend = h.ema20 > h.ema50 && h.ema50 > h.ema200 ? "EMA↑susun" : h.ema20 > h.ema50 ? "EMA↑lemah" : "EMA↓";
+    const volX = h.volumeSma20 > 0 ? (h.volume / h.volumeSma20).toFixed(1) : "?";
+    return `${c.symbol} | 24h ${c.chg24h >= 0 ? "+" : ""}${c.chg24h.toFixed(1)}% | px ${c.snapshot.price} | RSI ${h.rsi14.toFixed(0)} ADX4h ${c.snapshot.tf4h.adx14.toFixed(0)} MACDh ${h.macdHist.toFixed(2)} ATR% ${h.atrPct.toFixed(2)} vol×${volX} | ${trend}`;
+  });
+  const total = performance.wins + performance.losses;
+  const perf = total > 0 ? `\nPerforma lalu: win-rate ${((performance.wins / total) * 100).toFixed(0)}% (${total} trade), rata PnL ${performance.avgPnlPct.toFixed(2)}%` : "";
+  const prompt = `KANDIDAT MOMENTUM TERKUAT (saldo ${wallet.quote.toFixed(0)} ${(wallet.coins && Object.keys(wallet.coins)[0]) ? "quote" : ""}):\n${lines.join("\n")}${perf}\n\nPilih BUY terbaik atau HOLD.`;
+
+  const r = await ctx.groq.generateStructured(selectionSchema, [{ role: "user", content: prompt }], { systemPrompt: SELECT_SYSTEM, temperature: 0.3 });
+  const o = r.object;
+  const pickRaw = (o.pick ?? "").trim().toUpperCase();
+  const pick = pickRaw && pickRaw !== "HOLD" && candidates.some((c) => c.symbol === pickRaw) ? pickRaw : null;
+  log.info("selection", { pick: pick ?? "HOLD", confidence: o.confidence, candidates: candidates.length });
+  return {
+    pick,
+    confidence: Math.max(0, Math.min(100, Math.round(o.confidence))),
+    stopLoss: o.stopLoss,
+    takeProfit: o.takeProfit && o.takeProfit.length ? o.takeProfit.slice(0, 2) : null,
+    reasoning: o.reasoning.slice(0, 1000),
+    keyUsed: r.keyUsed,
+    modelUsed: r.modelUsed,
+  };
+}
+
 function countVotes(results: Decision[]): Record<Action, number> {
   const votes: Record<Action, number> = { BUY: 0, SELL: 0, HOLD: 0 };
   for (const r of results) votes[r.action]++;
