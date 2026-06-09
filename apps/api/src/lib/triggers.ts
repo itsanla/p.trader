@@ -1,61 +1,59 @@
-import type { OpenTrade } from "./db";
-import type { MarketSnapshot } from "./types";
+import type { MarketSnapshot, RouteKind, Signal } from "./types";
 
-// The 5-minute cron always runs this cheap, deterministic gate. The (token-costly,
-// non-deterministic) LLM only wakes when something here fires — this decouples how
-// often we MONITOR (every 5m) from how often we DECIDE (only on a real event),
-// which both saves quota and prevents 5-minute whipsaw over-trading.
+// Routing: the free per-minute watcher decides whether an event deserves the LLM at
+// all, and if so whether a quick single-model call ("normal") or a full multi-agent
+// debate is warranted. Debate is reserved for ABNORMAL / high-stakes moments — that
+// is where extra deliberation pays for itself; routine signals don't need it.
 
-export interface TriggerResult {
-  fire: boolean;
+export interface Route {
+  route: RouteKind;
+  abnormal: boolean;
   reasons: string[];
 }
 
-// Force a periodic "heartbeat" decision even on a quiet market, so the agent keeps
-// a fresh view and the learning loop gets regular data points.
-const HEARTBEAT_MINUTES = 60;
-const VOLUME_SPIKE_MULT = 1.5;
-const ATR_SPIKE_PCT = 1.5;
-const NEAR_LEVEL_PCT = 1.5; // open trade within this % of SL/TP
+const VOL_SPIKE = 3; // volume ≥ 3× its average
+const ATR_ABNORMAL = 2.5; // 1H ATR% above this = unusually volatile
+const STRONG_MOVE_ATR = 3; // price extended > 3× ATR from the 1H mean
 
-export function evaluateTriggers(
-  snap: MarketSnapshot,
-  openTrades: OpenTrade[],
-  minutesSinceLastDecision: number,
-): TriggerResult {
-  const reasons: string[] = [];
+/** Detect abnormal / high-stakes conditions that justify a debate. */
+function abnormalFlags(snap: MarketSnapshot, positionAtRisk: boolean): string[] {
   const h = snap.tf1h;
-  const price = snap.price;
+  const flags: string[] = [];
+  if (h.atrPct >= ATR_ABNORMAL) flags.push(`volatilitas abnormal (ATR ${h.atrPct.toFixed(2)}%)`);
+  if (h.volumeSma20 > 0 && h.volume >= VOL_SPIKE * h.volumeSma20) flags.push("lonjakan volume ekstrem");
+  if (h.atr14 > 0 && Math.abs(h.price - h.bbMid) > STRONG_MOVE_ATR * h.atr14) flags.push("harga sangat terentang dari mean");
+  // Macro vs short-term conflict: 1D bullish but 4H breaking down (or vice-versa).
+  const macroUp = snap.tf1d.price >= snap.tf1d.ema200;
+  const shortDown = snap.tf4h.ema20 < snap.tf4h.ema50;
+  if (macroUp && shortDown) flags.push("konflik timeframe (1D naik vs 4H melemah)");
+  if (positionAtRisk) flags.push("posisi terbuka mendekati stop");
+  return flags;
+}
 
-  // Momentum extremes on the 1H.
-  if (h.rsi14 <= 30) reasons.push(`RSI 1H oversold (${h.rsi14.toFixed(1)})`);
-  if (h.rsi14 >= 70) reasons.push(`RSI 1H overbought (${h.rsi14.toFixed(1)})`);
+/**
+ * Decide how to handle a symbol this minute.
+ *  - debate : abnormal event (and debate enabled) — argue it out across agents/models.
+ *  - normal : a clear actionable signal, or a position to manage — quick LLM call.
+ *  - none   : nothing actionable.
+ */
+export function evaluateRoute(
+  snap: MarketSnapshot,
+  sig: Signal,
+  opts: { hasPosition: boolean; positionAtRisk: boolean; debateEnabled: boolean; minStrength: number },
+): Route {
+  const flags = abnormalFlags(snap, opts.positionAtRisk);
+  const actionable = sig.bias !== "flat" && sig.strength >= opts.minStrength;
 
-  // Bollinger breakouts / band touches on the 1H.
-  if (price >= h.bbUpper) reasons.push("harga menembus Bollinger atas (1H)");
-  if (price <= h.bbLower) reasons.push("harga menembus Bollinger bawah (1H)");
-
-  // Volatility & participation spikes.
-  if (h.atrPct >= ATR_SPIKE_PCT) reasons.push(`volatilitas tinggi (ATR ${h.atrPct.toFixed(2)}%)`);
-  if (h.volumeSma20 > 0 && h.volume >= VOLUME_SPIKE_MULT * h.volumeSma20) reasons.push("lonjakan volume (1H)");
-
-  // MACD histogram very close to a zero-cross (momentum flip imminent).
-  if (h.atr14 > 0 && Math.abs(h.macdHist) < h.atr14 * 0.05) reasons.push("MACD mendekati persilangan (1H)");
-
-  // Risk management on open positions: price approaching SL or TP.
-  for (const t of openTrades) {
-    if (t.stopLoss && Math.abs(price - t.stopLoss) / price <= NEAR_LEVEL_PCT / 100) {
-      reasons.push(`posisi ${t.side} dekat stop-loss`);
-    }
-    if (t.takeProfit && Math.abs(price - t.takeProfit) / price <= NEAR_LEVEL_PCT / 100) {
-      reasons.push(`posisi ${t.side} dekat take-profit`);
-    }
+  if (flags.length > 0 && (actionable || opts.hasPosition)) {
+    return opts.debateEnabled
+      ? { route: "debate", abnormal: true, reasons: flags }
+      : { route: "normal", abnormal: true, reasons: ["(debat nonaktif) " + flags.join("; ")] };
   }
 
-  // Heartbeat — keep a regular cadence even when nothing fired.
-  if (reasons.length === 0 && minutesSinceLastDecision >= HEARTBEAT_MINUTES) {
-    reasons.push("heartbeat berkala");
+  if (actionable || opts.hasPosition) {
+    const why = actionable ? [`sinyal ${sig.bias} kuat (${sig.strength.toFixed(0)})`, ...sig.reasons.slice(0, 1)] : ["kelola posisi terbuka"];
+    return { route: "normal", abnormal: false, reasons: why };
   }
 
-  return { fire: reasons.length > 0, reasons };
+  return { route: "none", abnormal: false, reasons: [] };
 }

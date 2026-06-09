@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { buildCtx } from "./lib/context";
-import { getOpenTrades, getRecentAnalyses } from "./lib/db";
+import { getAllOpenTrades, getBotState, getRealizedPnlToday, getRecentAnalysesAll, setBotEnabled, setHaltedDate } from "./lib/db";
 import { diagnoseBybit, placeTestOrder } from "./lib/diag";
 import { logger } from "./lib/logger";
 import { flushLogs, flushLogsAsync } from "./lib/logsink";
@@ -15,48 +15,74 @@ const app = new Hono<{ Bindings: TraderEnv }>();
 
 app.use("*", cors({ origin: (o) => o ?? "*", allowHeaders: ["Content-Type", "x-admin-secret"], allowMethods: ["GET", "POST", "OPTIONS"] }));
 
-// Log every request and ship logs once it completes.
 app.use("*", async (c, next) => {
   const start = Date.now();
   const path = new URL(c.req.url).pathname;
-  log.info("req.start", { method: c.req.method, path });
   try {
     await next();
   } finally {
-    log.info("req.done", { method: c.req.method, path, status: c.res.status, ms: Date.now() - start });
+    log.info("req", { method: c.req.method, path, status: c.res.status, ms: Date.now() - start });
     flushLogs(c.env, c.executionCtx);
   }
 });
 
-// Guard manual/trading endpoints when ADMIN_SECRET is configured. Accepts the secret
-// from the x-admin-secret header OR a ?key= query param (the latter lets a plain GET
-// — e.g. a WebFetch probe — authenticate after deploy).
+// Guard: secret from x-admin-secret header OR ?key= query (so a GET WebFetch can authenticate).
 function requireAdmin(c: { env: TraderEnv; req: { header: (k: string) => string | undefined; query: (k: string) => string | undefined } }): boolean {
   const secret = c.env.ADMIN_SECRET;
-  if (!secret) return true; // unguarded if no secret set
+  if (!secret) return true;
   return c.req.header("x-admin-secret") === secret || c.req.query("key") === secret;
 }
 
-app.get("/", (c) => c.json({ ok: true, service: "trader-api", symbol: buildCtx(c.env).cfg.symbol }));
+app.get("/", (c) => c.json({ ok: true, service: "trader-api" }));
 
-// Current state: recent decisions + open trades.
-app.get("/status", async (c) => {
+// ── Wallet summary (for the dashboard) ────────────────────────────────────────
+app.get("/wallet", async (c) => {
   const ctx = buildCtx(c.env);
-  const [analyses, open] = await Promise.all([getRecentAnalyses(ctx.db, ctx.cfg.symbol, 10), getOpenTrades(ctx.db, ctx.cfg.symbol)]);
+  try {
+    const wallet = await ctx.bybit.getWalletBalance();
+    return c.json({ quoteCoin: ctx.cfg.quoteCoin, ...wallet });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 502);
+  }
+});
+
+// ── Bot status + on/off toggle ────────────────────────────────────────────────
+app.get("/bot", async (c) => {
+  const ctx = buildCtx(c.env);
+  const [state, realized] = await Promise.all([getBotState(ctx.db), getRealizedPnlToday(ctx.db)]);
   return c.json({
-    symbol: ctx.cfg.symbol,
-    config: { executeTrades: ctx.cfg.executeTrades, minConfidence: ctx.cfg.minConfidence, riskPct: ctx.cfg.riskPct, selfConsistency: ctx.cfg.selfConsistency },
-    openTrades: open,
-    recentAnalyses: analyses,
+    ...state,
+    realizedPnlToday: realized,
+    config: { universe: ctx.cfg.universe, executeTrades: ctx.cfg.executeTrades, riskPct: ctx.cfg.riskPct, minRR: ctx.cfg.minRR, killSwitchPct: ctx.cfg.killSwitchPct, debateEnabled: ctx.cfg.debateEnabled },
   });
 });
 
-// Groq key rotation + usage.
+app.post("/bot", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
+  let body: { enabled?: boolean };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON" }, 400);
+  }
+  if (typeof body.enabled !== "boolean") return c.json({ error: "enabled (boolean) required" }, 400);
+  const ctx = buildCtx(c.env);
+  await setBotEnabled(ctx.db, body.enabled);
+  if (body.enabled) await setHaltedDate(ctx.db, null); // turning on clears a prior kill-switch halt
+  log.info("bot.toggle", { enabled: body.enabled });
+  return c.json(await getBotState(ctx.db));
+});
+
+// ── Dashboard state: open trades + recent decisions ───────────────────────────
+app.get("/status", async (c) => {
+  const ctx = buildCtx(c.env);
+  const [open, analyses, state] = await Promise.all([getAllOpenTrades(ctx.db), getRecentAnalysesAll(ctx.db, 15), getBotState(ctx.db)]);
+  return c.json({ enabled: state.enabled, haltedDate: state.haltedDate, universe: ctx.cfg.universe, openTrades: open, recentAnalyses: analyses });
+});
+
 app.get("/usage", async (c) => c.json(await buildUsage(buildCtx(c.env))));
 
-// ── Diagnostics: prove the deployed Worker can reach Bybit (GET so a WebFetch can hit it) ──
-
-// Read-only probe: server time, instrument rules, price, kline+indicators, signed wallet.
+// ── Diagnostics (GET so a WebFetch can hit them) ──────────────────────────────
 app.get("/diag", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
   const ctx = buildCtx(c.env);
@@ -69,8 +95,6 @@ app.get("/diag", async (c) => {
   }
 });
 
-// Place ONE minimal market order so a real transaction appears on the demo account.
-// e.g. GET /diag/test-order?key=SECRET&side=Buy
 app.get("/diag/test-order", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
   const side = (c.req.query("side") ?? "Buy").toLowerCase() === "sell" ? "Sell" : "Buy";
@@ -84,13 +108,12 @@ app.get("/diag/test-order", async (c) => {
   }
 });
 
-// Manually trigger one monitoring cycle (handy for testing the demo loop).
+// Manually trigger one cycle / the evaluator.
 app.post("/run", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
   const ctx = buildCtx(c.env);
   try {
-    const result = await runCycle(ctx);
-    return c.json(result);
+    return c.json(await runCycle(ctx));
   } catch (err) {
     log.error("run.failed", { err: err instanceof Error ? err : String(err) });
     return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
@@ -99,24 +122,21 @@ app.post("/run", async (c) => {
   }
 });
 
-// Manually run the outcome evaluator (learning loop).
 app.post("/evaluate", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
   const ctx = buildCtx(c.env);
-  const scored = await evaluateOutcomes(ctx);
-  return c.json({ scored });
+  return c.json({ scored: await evaluateOutcomes(ctx) });
 });
 
-// ── Scheduled handler (cron: every 5 minutes, UTC) ────────────────────────────
+// ── Scheduled handler (cron: every minute, UTC) ───────────────────────────────
 async function runScheduled(env: TraderEnv): Promise<void> {
   const ctx = buildCtx(env);
   try {
     const result = await runCycle(ctx);
-    log.info("cron.cycle", { fired: result.fired, action: result.action, executed: result.executed, note: result.note });
+    log.info("cron.cycle", { ran: result.ran, exits: result.exits, action: result.action, executed: result.executed, note: result.note });
   } catch (err) {
     log.error("cron.cycle.failed", { err: err instanceof Error ? err : String(err) });
   }
-  // Score matured decisions so the agent learns over time.
   try {
     await evaluateOutcomes(ctx);
   } catch (err) {

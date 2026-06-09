@@ -56,6 +56,14 @@ export const marketMemory = sqliteTable("market_memory", {
   createdAt: int("created_at").notNull(),
 });
 
+// ── Bot on/off + halt state (single row id='global') ──────────────────────────
+export const botSettings = sqliteTable("bot_settings", {
+  id: text().primaryKey(), // 'global'
+  enabled: int().notNull().default(1), // 0 = trading fully stopped
+  haltedDate: text("halted_date"), // YYYY-MM-DD the daily kill-switch tripped
+  updatedAt: int("updated_at").notNull().default(0),
+});
+
 // ── Groq usage counters, per (day, key, model) — drives rotation + /usage ──────
 export const usageCounters = sqliteTable(
   "usage_counters",

@@ -1,224 +1,280 @@
 import { runDecision } from "./analysis";
+import { floorToStep } from "./bybit";
 import type { Ctx } from "./context";
+import { runDebate } from "./debate";
 import {
   closeTrade,
-  getOpenTrades,
+  getAllOpenTrades,
+  getBotState,
+  getOpenHeatQuote,
   getPerformance,
-  getRecentAnalyses,
+  getRealizedPnlToday,
   getUnevaluatedAnalyses,
   insertAnalysis,
   insertTrade,
   setAnalysisOutcome,
+  setHaltedDate,
+  type OpenTrade,
 } from "./db";
 import { computeIndicators } from "./indicators";
 import { logger } from "./logger";
-import { evaluateTriggers } from "./triggers";
+import { killSwitchTripped, longStop, longTarget, sizeLong } from "./risk";
+import { buildSignal, detectRegime, rankCandidates } from "./strategy";
+import { evaluateRoute } from "./triggers";
 import type { Decision, MarketSnapshot } from "./types";
 import { buildFingerprint, searchSimilar, storeMemory } from "./vector";
-import { floorToStep, type InstrumentRules } from "./bybit";
 
 const log = logger("trader");
 
+const MIN_ENTRY_STRENGTH = 55; // rule-based conviction needed before consulting the LLM
+
 export interface CycleResult {
-  fired: boolean;
-  reasons: string[];
+  ran: boolean;
+  note?: string;
+  scanned?: number;
+  exits?: number;
+  entrySymbol?: string;
   action?: string;
   confidence?: number;
   executed?: boolean;
-  note?: string;
+  route?: string;
 }
 
-/** Build the multi-timeframe snapshot from fresh Bybit klines. */
-async function buildSnapshot(ctx: Ctx): Promise<MarketSnapshot> {
-  const [c1h, c4h, c1d, price] = await Promise.all([
-    ctx.bybit.getKline("1h", 200),
-    ctx.bybit.getKline("4h", 120),
-    ctx.bybit.getKline("1d", 90),
-    ctx.bybit.getLastPrice(),
-  ]);
-  return {
-    symbol: ctx.cfg.symbol,
-    price: price || c1h[c1h.length - 1]?.close || 0,
-    tf1h: computeIndicators(c1h),
-    tf4h: computeIndicators(c4h),
-    tf1d: computeIndicators(c1d),
-  };
+function todayStr(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * One monitoring cycle (called every 5 minutes). Cheap until a trigger fires; only
- * then does it wake the LLM, decide, and (optionally) execute on the demo account.
- */
+async function buildSnapshot(ctx: Ctx, symbol: string): Promise<MarketSnapshot | null> {
+  try {
+    const [c1h, c4h, c1d, price] = await Promise.all([
+      ctx.bybit.getKline(symbol, "1h", 200),
+      ctx.bybit.getKline(symbol, "4h", 120),
+      ctx.bybit.getKline(symbol, "1d", 90),
+      ctx.bybit.getLastPrice(symbol),
+    ]);
+    if (!c1h.length) return null;
+    return {
+      symbol,
+      price: price || c1h[c1h.length - 1].close,
+      tf1h: computeIndicators(c1h),
+      tf4h: computeIndicators(c4h),
+      tf1d: computeIndicators(c1d),
+    };
+  } catch (err) {
+    log.warn("snapshot.failed", { symbol, err: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
+}
+
+/** One monitoring cycle — runs every minute. Cheap rule scan; LLM only where it earns its tokens. */
 export async function runCycle(ctx: Ctx): Promise<CycleResult> {
-  const symbol = ctx.cfg.symbol;
-  const snapshot = await buildSnapshot(ctx);
-  if (snapshot.price <= 0) {
-    log.warn("cycle.no-price");
-    return { fired: false, reasons: [], note: "no price data" };
+  const { db, cfg } = ctx;
+
+  // 0. Master switch.
+  const bot = await getBotState(db);
+  if (!bot.enabled) {
+    log.info("cycle.bot-off");
+    return { ran: false, note: "bot OFF — perdagangan dihentikan total" };
   }
 
-  const [openTrades, recent] = await Promise.all([getOpenTrades(ctx.db, symbol), getRecentAnalyses(ctx.db, symbol, 1)]);
-  const minutesSince = recent[0] ? (Date.now() - recent[0].ts) / 60000 : Number.POSITIVE_INFINITY;
-
-  const trig = evaluateTriggers(snapshot, openTrades, minutesSince);
-  if (!trig.fire) {
-    log.info("cycle.quiet", { price: snapshot.price, rsi1h: snapshot.tf1h.rsi14.toFixed(1) });
-    return { fired: false, reasons: [] };
+  // 1. Equity + daily kill-switch.
+  let equity = 0;
+  let wallet = await ctx.bybit.getWalletBalance().catch(() => null);
+  if (!wallet) return { ran: false, note: "wallet unavailable" };
+  equity = wallet.totalEquityQuote;
+  const today = todayStr();
+  if (bot.haltedDate === today) return { ran: false, note: "halted hari ini (kill-switch)" };
+  const realized = await getRealizedPnlToday(db);
+  if (killSwitchTripped(cfg, equity, realized)) {
+    await setHaltedDate(db, today);
+    log.warn("kill-switch", { realized, equity });
+    return { ran: false, note: `kill-switch aktif (rugi hari ini ${realized.toFixed(2)})` };
   }
-  log.info("cycle.fire", { reasons: trig.reasons.join("; ") });
 
-  // Gather decision context (wallet, memory, performance) only now that we're firing.
-  const fingerprint = buildFingerprint(snapshot);
-  const [wallet, similarMemories, performance] = await Promise.all([
-    ctx.bybit.getWalletBalance(),
-    searchSimilar(ctx, symbol, fingerprint),
-    getPerformance(ctx.db, symbol, 100),
+  // 2. Scan the universe (rule-based, zero tokens).
+  const snaps = (await Promise.all(cfg.universe.map((s) => buildSnapshot(ctx, s)))).filter((s): s is MarketSnapshot => s != null);
+  const snapBySymbol = new Map(snaps.map((s) => [s.symbol, s]));
+  const openTrades = await getAllOpenTrades(db);
+  const openSymbols = new Set(openTrades.map((t) => t.symbol));
+
+  // 3. EXIT pass — protective exits are rule-based (fast, deterministic, no LLM).
+  let exits = 0;
+  for (const t of openTrades) {
+    const snap = snapBySymbol.get(t.symbol);
+    if (!snap) continue;
+    const reason = exitReason(snap, t);
+    if (reason) {
+      await executeExit(ctx, snap, t, reason);
+      exits++;
+      openSymbols.delete(t.symbol);
+    }
+  }
+
+  // 4. ENTRY pass — at most one new position per cycle, only if we have room.
+  let entry: CycleResult = { ran: true, scanned: snaps.length, exits };
+  if (openTrades.length - exits < cfg.maxOpenPositions) {
+    const candidates = rankCandidates(snaps).filter((c) => c.signal.bias === "long" && c.score > 0 && !openSymbols.has(c.symbol));
+    const best = candidates[0];
+    if (best && best.signal.strength >= MIN_ENTRY_STRENGTH) {
+      const route = evaluateRoute(best.snapshot, best.signal, {
+        hasPosition: false,
+        positionAtRisk: false,
+        debateEnabled: cfg.debateEnabled,
+        minStrength: MIN_ENTRY_STRENGTH,
+      });
+      if (route.route !== "none") {
+        entry = { ...entry, ...(await considerEntry(ctx, best.snapshot, route.route, route.reasons, equity, wallet.quote, await getOpenHeatQuote(db))) };
+      }
+    }
+  }
+  log.info("cycle.done", { scanned: snaps.length, exits, action: entry.action, route: entry.route });
+  return entry;
+}
+
+/** Rule-based exit check for an open long. */
+function exitReason(snap: MarketSnapshot, t: OpenTrade): string | null {
+  if (t.side !== "Buy") return null;
+  const h = snap.tf1h;
+  if (t.stopLoss && snap.price <= t.stopLoss) return "stop-loss kena";
+  if (t.takeProfit && snap.price >= t.takeProfit) return "take-profit kena";
+  if (h.rsi14 >= 78) return `RSI ${h.rsi14.toFixed(0)} sangat overbought → amankan profit`;
+  const regime = detectRegime(snap);
+  if (regime === "trend_down") return "regime berbalik turun → keluar";
+  if (snap.price < h.ema50 && t.price < h.ema50 === false) return "harga tembus di bawah EMA50 (1H)";
+  return null;
+}
+
+async function executeExit(ctx: Ctx, snap: MarketSnapshot, t: OpenTrade, reason: string): Promise<void> {
+  const pnl = (snap.price - t.price) * t.qty;
+  log.info("exit", { symbol: t.symbol, reason, pnl: pnl.toFixed(2), execute: ctx.cfg.executeTrades });
+  if (ctx.cfg.executeTrades) {
+    await ctx.bybit.placeMarketOrder({ symbol: t.symbol, side: "Sell", qtyBase: t.qty, orderLinkId: crypto.randomUUID().replace(/-/g, "").slice(0, 32) });
+  }
+  await closeTrade(ctx.db, t.id, snap.price, pnl);
+  await storeMemory(ctx, t.symbol, `${t.symbol} | EXIT (${reason}) @ ${snap.price} | PnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} quote`);
+}
+
+async function considerEntry(
+  ctx: Ctx,
+  snap: MarketSnapshot,
+  route: "normal" | "debate",
+  reasons: string[],
+  equity: number,
+  quoteAvailable: number,
+  openHeat: number,
+): Promise<Partial<CycleResult>> {
+  const { db, cfg, bybit } = ctx;
+  const baseCoin = bybit.baseOf(snap.symbol);
+  const wallet = await bybit.getWalletBalance();
+
+  const [similar, performance] = await Promise.all([
+    searchSimilar(ctx, snap.symbol, buildFingerprint(snap)),
+    getPerformance(db, snap.symbol, 100),
   ]);
 
-  const { decision, keyUsed, modelUsed } = await runDecision(ctx, {
-    snapshot,
-    wallet,
-    openTrades,
-    triggerReasons: trig.reasons,
-    similarMemories,
-    performance,
-  });
+  const dctx = { snapshot: snap, wallet, baseCoin, openTrades: [], triggerReasons: reasons, similarMemories: similar, performance };
+  const out = route === "debate" ? await runDebate(ctx, dctx) : await runDecision(ctx, dctx);
+  const decision = out.decision;
 
-  // Execute (or paper-record) under hard safety gates.
-  const exec = await maybeExecute(ctx, snapshot, decision, wallet);
+  const exec = await maybeEnterLong(ctx, snap, decision, equity, quoteAvailable, openHeat);
 
   const analysisId = crypto.randomUUID();
-  await insertAnalysis(ctx.db, {
+  await insertAnalysis(db, {
     id: analysisId,
-    symbol,
+    symbol: snap.symbol,
     ts: Date.now(),
-    price: snapshot.price,
-    snapshot,
-    trigger: trig.reasons.join("; "),
+    price: snap.price,
+    snapshot: snap,
+    trigger: `${route}: ${reasons.join("; ")}`,
     decision,
     executed: exec.executed,
-    keyUsed,
-    modelUsed,
+    keyUsed: out.keyUsed,
+    modelUsed: out.modelUsed,
   });
 
   if (exec.executed && exec.trade) {
-    await insertTrade(ctx.db, {
+    await insertTrade(db, {
       id: exec.trade.id,
       analysisId,
-      symbol,
-      side: exec.trade.side,
+      symbol: snap.symbol,
+      side: "Buy",
       qty: exec.trade.qty,
-      price: snapshot.price,
-      stopLoss: decision.stopLoss,
-      takeProfit: decision.takeProfit?.[0] ?? null,
+      price: snap.price,
+      stopLoss: exec.stop,
+      takeProfit: exec.target,
       status: exec.trade.ok ? "submitted" : "rejected",
       bybitOrderId: exec.trade.orderId,
       error: exec.trade.error,
     });
   }
+  await storeMemory(ctx, snap.symbol, buildFingerprint(snap, { action: decision.action, confidence: decision.confidence }));
 
-  // Store the decision fingerprint now; outcome is appended later by the evaluator.
-  await storeMemory(ctx, symbol, buildFingerprint(snapshot, { action: decision.action, confidence: decision.confidence }));
-
-  return {
-    fired: true,
-    reasons: trig.reasons,
-    action: decision.action,
-    confidence: decision.confidence,
-    executed: exec.executed,
-    note: exec.note,
-  };
+  return { entrySymbol: snap.symbol, action: decision.action, confidence: decision.confidence, executed: exec.executed, route, note: exec.note };
 }
 
-interface ExecOutcome {
+interface EnterOutcome {
   executed: boolean;
   note?: string;
-  trade?: { id: string; side: "Buy" | "Sell"; qty: number; ok: boolean; orderId?: string; error?: string };
+  stop: number | null;
+  target: number | null;
+  trade?: { id: string; qty: number; ok: boolean; orderId?: string; error?: string };
 }
 
-/** Apply confidence/risk/balance gates, size the order, and place it (if live). */
-async function maybeExecute(ctx: Ctx, snap: MarketSnapshot, decision: Decision, wallet: { baseCoin: number; quoteCoin: number; totalEquityQuote: number }): Promise<ExecOutcome> {
+/** Apply confidence + risk gates, size the long, and place it (if live). */
+async function maybeEnterLong(ctx: Ctx, snap: MarketSnapshot, decision: Decision, equity: number, quoteAvailable: number, openHeat: number): Promise<EnterOutcome> {
   const { cfg } = ctx;
-  if (decision.action === "HOLD") return { executed: false, note: "HOLD" };
-  if (decision.confidence < cfg.minConfidence) return { executed: false, note: `confidence ${decision.confidence} < ${cfg.minConfidence}` };
-  if (decision.stopLoss == null) return { executed: false, note: "no stop-loss → skip" };
+  if (decision.action !== "BUY") return { executed: false, note: decision.action, stop: null, target: null };
+  if (decision.confidence < cfg.minConfidence) return { executed: false, note: `confidence ${decision.confidence} < ${cfg.minConfidence}`, stop: null, target: null };
 
   const price = snap.price;
-  const side: "Buy" | "Sell" = decision.action === "BUY" ? "Buy" : "Sell";
+  // Prefer the model's stop if sane, else ATR-based; target honors min R:R.
+  const atrStop = longStop(price, snap.tf1h.atr14, cfg.atrStopMult);
+  const stop = decision.stopLoss && decision.stopLoss < price && decision.stopLoss > atrStop * 0.9 ? decision.stopLoss : atrStop;
+  const target = decision.takeProfit?.[0] && decision.takeProfit[0] > price ? decision.takeProfit[0] : longTarget(price, stop, cfg.minRR);
 
-  // Risk-based sizing: qty so that (entry→stop) loss ≈ riskPct of equity.
-  const riskQuote = wallet.totalEquityQuote * (cfg.riskPct / 100);
-  const perUnitRisk = Math.abs(price - decision.stopLoss);
-  if (perUnitRisk <= 0) return { executed: false, note: "invalid stop distance" };
-  let qty = riskQuote / perUnitRisk;
+  const sized = sizeLong({ cfg, equity, quoteAvailable, price, stop, target, openHeatQuote: openHeat });
+  if (sized.qty <= 0) return { executed: false, note: sized.reasons.join("; ") || "size 0", stop, target };
 
-  // Cap by max position size.
-  const maxQtyByCap = (wallet.totalEquityQuote * (cfg.maxPositionPct / 100)) / price;
-  qty = Math.min(qty, maxQtyByCap);
-
-  // Cap by what we can actually trade on spot.
-  if (side === "Buy") qty = Math.min(qty, (wallet.quoteCoin * 0.99) / price);
-  else qty = Math.min(qty, wallet.baseCoin * 0.99);
-
-  let rules: InstrumentRules;
+  let rules;
   try {
-    rules = await ctx.bybit.getInstrumentRules();
+    rules = await ctx.bybit.getInstrumentRules(snap.symbol);
   } catch (err) {
-    return { executed: false, note: `instrument rules failed: ${err instanceof Error ? err.message : String(err)}` };
+    return { executed: false, note: `rules failed: ${err instanceof Error ? err.message : String(err)}`, stop, target };
   }
+  const qty = floorToStep(sized.qty, rules.basePrecision);
+  if (qty < rules.minOrderQty || qty <= 0) return { executed: false, note: `qty ${qty} < min ${rules.minOrderQty}`, stop, target };
+  if (qty * price < rules.minOrderAmt) return { executed: false, note: `notional ${(qty * price).toFixed(2)} < min ${rules.minOrderAmt}`, stop, target };
 
-  qty = floorToStep(qty, rules.basePrecision);
-  if (qty < rules.minOrderQty || qty <= 0) return { executed: false, note: `qty ${qty} below min ${rules.minOrderQty}` };
-  if (qty * price < rules.minOrderAmt) return { executed: false, note: `notional ${(qty * price).toFixed(2)} below min ${rules.minOrderAmt}` };
-
-  if (!cfg.executeTrades) {
-    log.info("paper", { side, qty, price });
-    return { executed: false, note: `paper mode (would ${side} ${qty})` };
-  }
+  if (!cfg.executeTrades) return { executed: false, note: `paper: would BUY ${qty} (R:R ${sized.rr.toFixed(2)})`, stop, target };
 
   const id = crypto.randomUUID();
-  // NOTE: broker-side TP/SL on Bybit SPOT needs extra params (tpslMode, slOrderType)
-  // and is easily rejected, so for the demo loop we place a clean market order and
-  // keep SL/TP in our own DB — exits are managed by our evaluator/triggers. Wiring
-  // native spot TP/SL is a follow-up once the base loop is validated.
-  const res = await ctx.bybit.placeMarketOrder({
-    side,
-    qtyBase: qty,
-    orderLinkId: id.replace(/-/g, "").slice(0, 32),
-    stopLoss: null,
-    takeProfit: null,
-    tickSize: rules.tickSize,
-  });
-
+  const res = await ctx.bybit.placeMarketOrder({ symbol: snap.symbol, side: "Buy", qtyBase: qty, orderLinkId: id.replace(/-/g, "").slice(0, 32) });
   return {
     executed: res.ok,
-    note: res.ok ? `${side} ${qty} @~${price}` : `order rejected: ${res.error}`,
-    trade: { id, side, qty, ok: res.ok, orderId: res.orderId, error: res.error },
+    note: res.ok ? `BUY ${qty} @~${price} (R:R ${sized.rr.toFixed(2)})` : `rejected: ${res.error}`,
+    stop,
+    target,
+    trade: { id, qty, ok: res.ok, orderId: res.orderId, error: res.error },
   };
 }
 
-/**
- * Learning loop: score analyses old enough to judge by comparing the price then vs
- * now, then append the outcome to long-term memory. Runs alongside the cycle.
- */
-const EVAL_AGE_MS = 12 * 3600_000; // judge a decision after 12 hours
-const CORRECT_PNL_PCT = 0.5; // a BUY/SELL is "correct" if it moved ≥0.5% the right way
+// ── Learning loop ─────────────────────────────────────────────────────────────
+const EVAL_AGE_MS = 12 * 3600_000;
+const CORRECT_PNL_PCT = 0.5;
 
 export async function evaluateOutcomes(ctx: Ctx): Promise<number> {
   const due = await getUnevaluatedAnalyses(ctx.db, Date.now() - EVAL_AGE_MS, 20);
   if (due.length === 0) return 0;
-  let nowPrice = 0;
-  try {
-    nowPrice = await ctx.bybit.getLastPrice();
-  } catch {
-    return 0;
-  }
-  if (nowPrice <= 0) return 0;
-
+  const priceCache = new Map<string, number>();
   let scored = 0;
   for (const a of due) {
+    let nowPrice = priceCache.get(a.symbol);
+    if (nowPrice == null) {
+      nowPrice = await ctx.bybit.getLastPrice(a.symbol).catch(() => 0);
+      priceCache.set(a.symbol, nowPrice);
+    }
+    if (!nowPrice) continue;
     const movePct = ((nowPrice - a.price) / a.price) * 100;
-    // For BUY a rise is good; for SELL a fall is good; HOLD is "correct" if price stayed flat.
     let pnlPct: number;
     let correct: boolean;
     if (a.action === "BUY") {
@@ -232,17 +288,6 @@ export async function evaluateOutcomes(ctx: Ctx): Promise<number> {
       correct = Math.abs(movePct) < CORRECT_PNL_PCT;
     }
     await setAnalysisOutcome(ctx.db, a.id, pnlPct, correct);
-
-    // Close any open trade tied to a now-judged decision (demo bookkeeping).
-    if (a.executed) {
-      const open = await getOpenTrades(ctx.db, a.symbol);
-      for (const t of open) {
-        const pnlQuote = (t.side === "Buy" ? nowPrice - t.price : t.price - nowPrice) * t.qty;
-        await closeTrade(ctx.db, t.id, nowPrice, pnlQuote);
-      }
-    }
-
-    // Append the realized outcome to long-term memory so similar future setups recall it.
     await storeMemory(ctx, a.symbol, `${a.symbol} | aksi ${a.action} conf ${a.confidence} @ ${a.price} | HASIL ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% (${correct ? "benar" : "salah"})`);
     scored++;
   }

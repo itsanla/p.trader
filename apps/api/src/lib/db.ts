@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, isNull, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNull, lt, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
-import { analyses, marketMemory, trades, usageCounters } from "../db/schema";
+import { analyses, botSettings, marketMemory, trades, usageCounters } from "../db/schema";
 import { logger } from "./logger";
 import type { Decision } from "./types";
 
@@ -76,6 +76,25 @@ export async function getRecentAnalyses(db: DB, symbol: string, limit = 5): Prom
     .where(eq(analyses.symbol, symbol))
     .orderBy(desc(analyses.ts))
     .limit(limit);
+  return rows.map((r) => ({
+    id: r.id,
+    symbol: r.symbol,
+    ts: r.ts,
+    price: r.price,
+    trigger: r.trigger,
+    action: r.action,
+    confidence: r.confidence,
+    reasoning: r.reasoning,
+    stopLoss: r.stopLoss,
+    executed: r.executed,
+    outcomePnlPct: r.outcomePnlPct,
+    outcomeCorrect: r.outcomeCorrect,
+  }));
+}
+
+/** Most recent analyses across ALL symbols (for the dashboard). */
+export async function getRecentAnalysesAll(db: DB, limit = 15): Promise<AnalysisRow[]> {
+  const rows = await db.select().from(analyses).orderBy(desc(analyses.ts)).limit(limit);
   return rows.map((r) => ({
     id: r.id,
     symbol: r.symbol,
@@ -219,6 +238,75 @@ export async function closeTrade(db: DB, id: string, exitPrice: number, pnlQuote
     .update(trades)
     .set({ status: "closed", closedAt: Date.now(), exitPrice, pnlQuote })
     .where(eq(trades.id, id));
+}
+
+/** All open trades across the whole universe. */
+export async function getAllOpenTrades(db: DB): Promise<OpenTrade[]> {
+  const rows = await db
+    .select()
+    .from(trades)
+    .where(sql`${trades.status} IN ('submitted','filled')`)
+    .orderBy(desc(trades.createdAt));
+  return rows.map((r) => ({
+    id: r.id,
+    symbol: r.symbol,
+    side: r.side,
+    qty: r.qty,
+    price: r.price,
+    stopLoss: r.stopLoss,
+    takeProfit: r.takeProfit,
+    createdAt: r.createdAt,
+  }));
+}
+
+/** Sum of open risk (entry→stop) across open long positions — for portfolio-heat caps. */
+export async function getOpenHeatQuote(db: DB): Promise<number> {
+  const open = await getAllOpenTrades(db);
+  let heat = 0;
+  for (const t of open) if (t.side === "Buy" && t.stopLoss) heat += Math.max(0, (t.price - t.stopLoss) * t.qty);
+  return heat;
+}
+
+/** Realized PnL (quote) from trades closed today — drives the daily kill-switch. */
+export async function getRealizedPnlToday(db: DB): Promise<number> {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const rows = await db
+    .select({ pnl: trades.pnlQuote })
+    .from(trades)
+    .where(and(eq(trades.status, "closed"), gte(trades.closedAt, start.getTime())));
+  return rows.reduce((a, r) => a + (r.pnl ?? 0), 0);
+}
+
+// ── Bot on/off + halt state ──────────────────────────────────────────────────
+
+export interface BotState {
+  enabled: boolean;
+  haltedDate: string | null;
+  updatedAt: number;
+}
+
+export async function getBotState(db: DB): Promise<BotState> {
+  const row = await db.select().from(botSettings).where(eq(botSettings.id, "global")).limit(1);
+  if (!row[0]) return { enabled: true, haltedDate: null, updatedAt: 0 }; // default ON until toggled
+  return { enabled: row[0].enabled === 1, haltedDate: row[0].haltedDate, updatedAt: row[0].updatedAt };
+}
+
+export async function setBotEnabled(db: DB, enabled: boolean): Promise<void> {
+  log.info("setBotEnabled", { enabled });
+  const now = Date.now();
+  await db
+    .insert(botSettings)
+    .values({ id: "global", enabled: enabled ? 1 : 0, updatedAt: now })
+    .onConflictDoUpdate({ target: botSettings.id, set: { enabled: enabled ? 1 : 0, updatedAt: now } });
+}
+
+export async function setHaltedDate(db: DB, date: string | null): Promise<void> {
+  const now = Date.now();
+  await db
+    .insert(botSettings)
+    .values({ id: "global", enabled: 1, haltedDate: date, updatedAt: now })
+    .onConflictDoUpdate({ target: botSettings.id, set: { haltedDate: date, updatedAt: now } });
 }
 
 // ── Market memory (mirror of Vectorize) ───────────────────────────────────────

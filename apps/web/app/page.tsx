@@ -1,197 +1,244 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChatBubble } from "@/components/chat-bubble";
-import { SearchCard } from "@/components/search-card";
-import { fetchHistory, streamChat } from "@/lib/api";
-import type { Message } from "@/lib/types";
+import { useCallback, useEffect, useState } from "react";
+import {
+  fetchBot,
+  fetchStatus,
+  fetchWallet,
+  getAdminSecret,
+  setAdminSecret,
+  toggleBot,
+  type BotInfo,
+  type Status,
+  type Wallet,
+} from "@/lib/trader-api";
 
-const CACHE_KEY = "linda_chat_cache";
+const POLL_MS = 15_000;
 
-function loadCache(): Message[] {
-  if (typeof window === "undefined") return [];
-  try {
-    return JSON.parse(window.localStorage.getItem(CACHE_KEY) ?? "[]") as Message[];
-  } catch {
-    return [];
-  }
+function fmt(n: number, d = 2): string {
+  return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
-function saveCache(msgs: Message[]) {
-  try {
-    window.localStorage.setItem(CACHE_KEY, JSON.stringify(msgs.slice(-60)));
-  } catch {
-    /* ignore */
-  }
+function ago(ts: number): string {
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}d lalu`;
+  if (s < 3600) return `${Math.round(s / 60)}m lalu`;
+  if (s < 86400) return `${Math.round(s / 3600)}j lalu`;
+  return `${Math.round(s / 86400)}h lalu`;
 }
 
-export default function ChatPage() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [nextBefore, setNextBefore] = useState<number | null>(null);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const [loadingOlder, setLoadingOlder] = useState(false);
+export default function Dashboard() {
+  const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [bot, setBot] = useState<BotInfo | null>(null);
+  const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [secret, setSecret] = useState("");
 
-  // Instant render from cache, then reconcile with the latest page from D1.
-  useEffect(() => {
-    const cached = loadCache();
-    if (cached.length) setMessages(cached);
-    void fetchHistory()
-      .then(({ messages: fresh, nextBefore: nb }) => {
-        setMessages(fresh);
-        setNextBefore(nb);
-        saveCache(fresh);
-      })
-      .catch(() => setError("Gagal memuat riwayat."));
-  }, []);
-
-  const scrollToBottom = useCallback(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, []);
-
-  useEffect(() => {
-    if (!loadingOlder) scrollToBottom();
-  }, [messages.length, sending, scrollToBottom, loadingOlder]);
-
-  // Load older messages when scrolled near the top (infinite scroll-up).
-  async function onScroll() {
-    const el = scrollRef.current;
-    if (!el || loadingOlder || nextBefore == null || el.scrollTop > 80) return;
-    setLoadingOlder(true);
-    const prevH = el.scrollHeight;
+  const load = useCallback(async () => {
     try {
-      const { messages: older, nextBefore: nb } = await fetchHistory(nextBefore);
-      if (older.length) {
-        setMessages((prev) => [...older, ...prev]);
-        setNextBefore(nb);
-        requestAnimationFrame(() => {
-          if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight - prevH;
-        });
-      } else {
-        setNextBefore(null);
-      }
-    } finally {
-      setLoadingOlder(false);
-    }
-  }
-
-  // Mutate the streaming (last) assistant message.
-  function patchLast(fn: (m: Message) => Message) {
-    setMessages((prev) => {
-      const next = [...prev];
-      for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].role === "assistant") {
-          next[i] = fn(next[i]);
-          break;
-        }
-      }
-      return next;
-    });
-  }
-
-  async function send(e: React.FormEvent) {
-    e.preventDefault();
-    const text = input.trim();
-    if (!text || sending) return;
-    setInput("");
-    setError(null);
-    setSending(true);
-
-    const now = Date.now();
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: text, timestamp: now },
-      { role: "assistant", content: "", timestamp: now + 1 },
-    ]);
-
-    try {
-      await streamChat(text, {
-        onSearch: (query) => patchLast((m) => ({ ...m, search: { query, count: 0, sources: [], status: "searching" } })),
-        onSources: (count, sources) =>
-          patchLast((m) => ({ ...m, search: { query: m.search?.query ?? "", count, sources, status: "done" } })),
-        onDelta: (t) => patchLast((m) => ({ ...m, content: m.content + t })),
-        onDone: (d) => patchLast((m) => ({ ...m, content: d.reply, keyUsed: d.keyUsed, modelUsed: d.model, timestamp: d.timestamp })),
-        onError: (msg) => patchLast((m) => ({ ...m, content: msg })),
-      });
+      const [w, b, s] = await Promise.all([fetchWallet().catch(() => null), fetchBot(), fetchStatus()]);
+      if (w) setWallet(w);
+      setBot(b);
+      setStatus(s);
+      setError(null);
     } catch {
-      setError("Gagal mengirim pesan. Coba lagi.");
-      patchLast((m) => ({ ...m, content: m.content || "Gagal terhubung." }));
-    } finally {
-      setSending(false);
-      setMessages((prev) => {
-        saveCache(prev);
-        return prev;
-      });
+      setError("Gagal memuat data dari API. Cek NEXT_PUBLIC_API_URL.");
     }
+  }, []);
+
+  useEffect(() => {
+    setSecret(getAdminSecret());
+    void load();
+    const t = setInterval(load, POLL_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function onToggle() {
+    if (!bot) return;
+    if (!getAdminSecret()) {
+      setError("Masukkan secret admin dulu untuk mengontrol bot.");
+      return;
+    }
+    setBusy(true);
+    const res = await toggleBot(!bot.enabled);
+    setBusy(false);
+    if (!res.ok) {
+      setError(res.error ?? "Gagal mengubah status bot.");
+      return;
+    }
+    setError(null);
+    await load();
   }
+
+  const enabled = bot?.enabled ?? false;
+  const halted = bot?.haltedDate != null;
 
   return (
-    <div className="page-shell">
-      <section className="chat-shell reveal">
-        <header className="chat-header">
-          <div>
-            <div className="eyebrow">Chat AI</div>
-            <h1 className="title-display">Linda AI Console</h1>
-            <p className="mt-2 text-sm text-muted">
-              Percakapan ini berbagi memori dengan WhatsApp. Riwayat disimpan lokal lalu disinkron
-              saat koneksi stabil.
-            </p>
-          </div>
-          <div className="flex flex-col items-end gap-2">
-            <span className="chip accent">Realtime streaming</span>
-            <button type="button" onClick={scrollToBottom} className="btn-secondary">
-              Scroll ke terbaru
-            </button>
-          </div>
-        </header>
-
-        <div ref={scrollRef} onScroll={onScroll} className="chat-stream">
-          {loadingOlder && <p className="text-center text-xs text-muted">Memuat pesan lama...</p>}
-          {messages.length === 0 && (
-            <p className="text-sm text-muted">Belum ada percakapan. Sapa Linda untuk memulai.</p>
-          )}
-
-          {messages.map((m, i) => (
-            <div key={m.id ?? `t${m.timestamp}-${i}`} className="space-y-3">
-              {m.role === "assistant" && m.search && (
-                <div className="chat-row">
-                  <div className="chat-avatar">L</div>
-                  <div className="chat-card search">
-                    <SearchCard info={m.search} />
-                  </div>
-                </div>
-              )}
-              {(m.content || m.role === "user") && <ChatBubble message={m} />}
-              {m.role === "assistant" && !m.content && !m.search && sending && i === messages.length - 1 && (
-                <div className="chat-row">
-                  <div className="chat-avatar">L</div>
-                  <div className="typing-pill">Linda sedang mengetik</div>
-                </div>
-              )}
-            </div>
-          ))}
-          <div ref={bottomRef} />
+    <div className="space-y-6">
+      <header className="flex items-center justify-between">
+        <div>
+          <div className="eyebrow">AI Crypto Agent</div>
+          <h1 className="title-display">Trader Dashboard</h1>
         </div>
+        <span className={`chip ${enabled ? "accent" : ""}`}>{enabled ? "🟢 BOT AKTIF" : "🔴 BOT MATI"}</span>
+      </header>
 
-        {error && <p className="alert">{error}</p>}
+      {error && <p className="alert">{error}</p>}
 
-        <div className="compose-wrap">
-          <form onSubmit={send} className="compose-bar">
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Tulis pesan ke Linda..."
-              disabled={sending}
-              className="input-field flex-1"
+      {/* Wallet summary */}
+      <section className="surface-card p-6">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Ringkasan Wallet</h2>
+          <span className="text-xs text-muted">demo · {wallet?.quoteCoin ?? "USDC"}</span>
+        </div>
+        {wallet ? (
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <Stat label="Total Ekuitas" value={`${fmt(wallet.totalEquityQuote)} ${wallet.quoteCoin}`} big />
+            <Stat label={`Saldo ${wallet.quoteCoin}`} value={fmt(wallet.quote)} />
+            <Stat
+              label="PnL Hari Ini"
+              value={`${(bot?.realizedPnlToday ?? 0) >= 0 ? "+" : ""}${fmt(bot?.realizedPnlToday ?? 0)}`}
+              tone={(bot?.realizedPnlToday ?? 0) >= 0 ? "pos" : "neg"}
             />
-            <button type="submit" disabled={sending || !input.trim()} className="btn-primary">
-              Kirim
-            </button>
-          </form>
+            <Stat label="Aset" value={`${Object.values(wallet.coins).filter((v) => v > 0).length} koin`} />
+          </div>
+        ) : (
+          <p className="text-sm text-muted">Memuat saldo…</p>
+        )}
+        {wallet && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {Object.entries(wallet.coins)
+              .filter(([, v]) => v > 0)
+              .map(([coin, v]) => (
+                <span key={coin} className="chip">
+                  {coin}: {fmt(v, coin === wallet.quoteCoin ? 2 : 6)}
+                </span>
+              ))}
+          </div>
+        )}
+      </section>
+
+      {/* Bot control */}
+      <section className="surface-card p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold">Kontrol Bot</h2>
+            <p className="mt-1 text-sm text-muted">
+              {enabled
+                ? "Bot sedang memindai pasar tiap menit dan boleh membuka posisi."
+                : "Bot dimatikan — tidak ada perdagangan sama sekali."}
+              {halted && <span className="text-[color:var(--accent-2)]"> · kill-switch aktif hari ini</span>}
+            </p>
+            {bot && (
+              <p className="mt-2 text-xs text-muted">
+                Universe: {bot.config.universe.join(", ")} · risk {bot.config.riskPct}% · R:R≥{bot.config.minRR} · kill-switch {bot.config.killSwitchPct}% ·
+                {bot.config.debateEnabled ? " debat ON" : " debat OFF"} ·{bot.config.executeTrades ? " LIVE" : " PAPER"}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onToggle}
+            disabled={busy || !bot}
+            className={enabled ? "btn-secondary" : "btn-primary"}
+            style={{ minWidth: 140 }}
+          >
+            {busy ? "…" : enabled ? "Matikan Bot" : "Nyalakan Bot"}
+          </button>
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <input
+            type="password"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+            onBlur={() => setAdminSecret(secret.trim())}
+            placeholder="Secret admin (untuk kontrol)"
+            className="input-field"
+            style={{ maxWidth: 280 }}
+          />
+          <button type="button" className="btn-secondary" onClick={() => setAdminSecret(secret.trim())}>
+            Simpan
+          </button>
         </div>
       </section>
+
+      {/* Open positions */}
+      <section className="surface-card p-6">
+        <h2 className="mb-3 text-lg font-semibold">Posisi Terbuka</h2>
+        {status && status.openTrades.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs uppercase tracking-wide text-muted">
+                <tr>
+                  <th className="py-2">Pasangan</th>
+                  <th>Arah</th>
+                  <th>Qty</th>
+                  <th>Entry</th>
+                  <th>Stop</th>
+                  <th>Target</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status.openTrades.map((t) => (
+                  <tr key={t.id} className="border-t border-[color:var(--border)]">
+                    <td className="py-2 font-medium">{t.symbol}</td>
+                    <td>{t.side}</td>
+                    <td>{fmt(t.qty, 6)}</td>
+                    <td>{fmt(t.price)}</td>
+                    <td>{t.stopLoss ? fmt(t.stopLoss) : "—"}</td>
+                    <td>{t.takeProfit ? fmt(t.takeProfit) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-sm text-muted">Tidak ada posisi terbuka.</p>
+        )}
+      </section>
+
+      {/* Recent decisions */}
+      <section className="surface-card p-6">
+        <h2 className="mb-3 text-lg font-semibold">Keputusan Terbaru</h2>
+        {status && status.recentAnalyses.length > 0 ? (
+          <ul className="space-y-2">
+            {status.recentAnalyses.map((a) => (
+              <li key={a.id} className="flex items-start justify-between gap-3 border-t border-[color:var(--border)] py-2 text-sm">
+                <div>
+                  <span className={`chip ${a.action === "BUY" ? "accent" : ""}`}>{a.action}</span>
+                  <span className="ml-2 font-medium">{a.symbol}</span>
+                  <span className="ml-2 text-muted">conf {a.confidence}</span>
+                  {a.executed === 1 && <span className="ml-2 text-[color:var(--accent)]">✓ eksekusi</span>}
+                  <p className="mt-1 text-xs text-muted">{a.reasoning?.slice(0, 140)}</p>
+                </div>
+                <div className="shrink-0 text-right text-xs text-muted">
+                  {ago(a.ts)}
+                  {a.outcomePnlPct != null && (
+                    <div className={a.outcomeCorrect ? "text-[color:var(--accent)]" : "text-[color:var(--accent-2)]"}>
+                      {a.outcomePnlPct >= 0 ? "+" : ""}
+                      {fmt(a.outcomePnlPct)}%
+                    </div>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-sm text-muted">Belum ada keputusan.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function Stat({ label, value, big, tone }: { label: string; value: string; big?: boolean; tone?: "pos" | "neg" }) {
+  const color = tone === "pos" ? "var(--accent)" : tone === "neg" ? "var(--accent-2)" : "var(--foreground)";
+  return (
+    <div>
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className={big ? "text-2xl font-bold" : "text-lg font-semibold"} style={{ color }}>
+        {value}
+      </div>
     </div>
   );
 }

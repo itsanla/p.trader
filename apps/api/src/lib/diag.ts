@@ -5,9 +5,7 @@ import { logger } from "./logger";
 const log = logger("diag");
 
 // Read-only Bybit connectivity probe. Runs each call independently so a partial
-// failure (e.g. signed endpoints rejecting bad keys, public endpoints still OK) is
-// visible step-by-step. Used to prove the deployed Worker can reach Bybit — the
-// thing a Telkomsel-blocked local machine cannot do.
+// failure is visible step-by-step. Used to prove the deployed Worker can reach Bybit.
 
 interface Step {
   step: string;
@@ -18,8 +16,7 @@ interface Step {
 
 async function run(step: string, fn: () => Promise<unknown>): Promise<Step> {
   try {
-    const data = await fn();
-    return { step, ok: true, data };
+    return { step, ok: true, data: await fn() };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log.warn("step.failed", { step, error });
@@ -29,6 +26,7 @@ async function run(step: string, fn: () => Promise<unknown>): Promise<Step> {
 
 export async function diagnoseBybit(ctx: Ctx): Promise<{ ok: boolean; baseUrl: string; symbol: string; steps: Step[] }> {
   const { bybit, cfg } = ctx;
+  const symbol = cfg.symbol;
   const steps: Step[] = [];
 
   steps.push(
@@ -37,51 +35,34 @@ export async function diagnoseBybit(ctx: Ctx): Promise<{ ok: boolean; baseUrl: s
       return { serverTimeIso: new Date(t).toISOString(), skewMsVsWorker: t - Date.now() };
     }),
   );
-
-  steps.push(await run("instruments-info", () => bybit.getInstrumentRules()));
-  steps.push(await run("ticker-last-price", async () => ({ lastPrice: await bybit.getLastPrice() })));
-
+  steps.push(await run("instruments-info", () => bybit.getInstrumentRules(symbol)));
+  steps.push(await run("ticker-last-price", async () => ({ lastPrice: await bybit.getLastPrice(symbol) })));
   steps.push(
     await run("kline-1h+indicators", async () => {
-      const candles = await bybit.getKline("1h", 200);
+      const candles = await bybit.getKline(symbol, "1h", 200);
       const ind = computeIndicators(candles);
-      return {
-        candles: candles.length,
-        lastClose: candles[candles.length - 1]?.close,
-        rsi14: Number(ind.rsi14.toFixed(2)),
-        ema50: Number(ind.ema50.toFixed(2)),
-        atrPct: Number(ind.atrPct.toFixed(3)),
-      };
+      return { candles: candles.length, lastClose: candles[candles.length - 1]?.close, rsi14: +ind.rsi14.toFixed(2), adx14: +ind.adx14.toFixed(2), atrPct: +ind.atrPct.toFixed(3) };
     }),
   );
-
-  // Signed endpoint — this is the real test of API key + HMAC signature.
   steps.push(await run("wallet-balance (signed)", () => bybit.getWalletBalance()));
 
-  const ok = steps.every((s) => s.ok);
-  return { ok, baseUrl: (cfg.bybitBaseUrl || "").replace(/\/$/, ""), symbol: cfg.symbol, steps };
+  return { ok: steps.every((s) => s.ok), baseUrl: cfg.bybitBaseUrl.replace(/\/$/, ""), symbol, steps };
 }
 
-/**
- * Place ONE minimal market order so a real transaction shows up on the demo account.
- * Sized to the instrument's minimum (qty and notional). Explicit test tool — guarded
- * by the admin secret at the route layer.
- */
+/** Place ONE minimal market order so a real transaction shows up on the demo account. */
 export async function placeTestOrder(ctx: Ctx, side: "Buy" | "Sell"): Promise<unknown> {
-  const { bybit } = ctx;
-  const rules = await bybit.getInstrumentRules();
-  const price = await bybit.getLastPrice();
+  const { bybit, cfg } = ctx;
+  const symbol = cfg.symbol;
+  const rules = await bybit.getInstrumentRules(symbol);
+  const price = await bybit.getLastPrice(symbol);
   if (price <= 0) throw new Error("no price");
 
-  // Smallest qty that satisfies BOTH minOrderQty and minOrderAmt (+10% buffer over notional).
   const minByAmt = rules.minOrderAmt > 0 ? (rules.minOrderAmt * 1.1) / price : 0;
-  let qty = Math.max(rules.minOrderQty, minByAmt);
-  // Round UP to base precision so we never fall below the minimum.
   const decimals = (rules.basePrecision.toString().split(".")[1] ?? "").length || 6;
-  qty = Number((Math.ceil(qty / rules.basePrecision) * rules.basePrecision).toFixed(decimals));
+  const qty = Number((Math.ceil(Math.max(rules.minOrderQty, minByAmt) / rules.basePrecision) * rules.basePrecision).toFixed(decimals));
 
-  log.info("test-order", { side, qty, price, notional: (qty * price).toFixed(2) });
+  log.info("test-order", { symbol, side, qty, price });
   const id = crypto.randomUUID().replace(/-/g, "").slice(0, 32);
-  const res = await bybit.placeMarketOrder({ side, qtyBase: qty, orderLinkId: id, stopLoss: null, takeProfit: null, tickSize: rules.tickSize });
-  return { side, qty, refPrice: price, notional: Number((qty * price).toFixed(2)), orderLinkId: id, result: res };
+  const result = await bybit.placeMarketOrder({ symbol, side, qtyBase: qty, orderLinkId: id });
+  return { symbol, side, qty, refPrice: price, notional: +(qty * price).toFixed(2), orderLinkId: id, result };
 }

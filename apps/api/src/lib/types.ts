@@ -14,14 +14,22 @@ export interface TraderEnv {
   ADMIN_SECRET?: string; // if set, guards manual trigger endpoints
 
   // Trading config (all optional → sensible defaults in config.ts)
-  TRADING_SYMBOL?: string; // e.g. "BTCUSDC"
-  BASE_COIN?: string; // e.g. "BTC"
+  TRADING_SYMBOL?: string; // primary symbol (kept for single-symbol endpoints), e.g. "BTCUSDC"
+  UNIVERSE?: string; // CSV of symbols to scan, e.g. "BTCUSDC,ETHUSDC,SOLUSDC,XRPUSDC"
   QUOTE_COIN?: string; // e.g. "USDC"
   EXECUTE_TRADES?: string; // "true" | "false" — false = paper mode (decide + record, no order)
   MIN_CONFIDENCE?: string; // skip BUY/SELL below this (0-100)
   RISK_PCT?: string; // % of quote equity to risk per trade
   MAX_POSITION_PCT?: string; // hard cap: max % of equity in one position
-  SELF_CONSISTENCY?: string; // number of LLM samples to vote (1 = off)
+  PORTFOLIO_HEAT_PCT?: string; // max total open risk across positions
+  MIN_RR?: string; // minimum reward:risk to take a trade
+  ATR_STOP_MULT?: string; // stop = entry ∓ mult × ATR
+  FEE_PCT?: string; // taker fee per side, % (Bybit spot ≈ 0.1)
+  SLIPPAGE_PCT?: string; // assumed spread/slippage per side, %
+  KILL_SWITCH_PCT?: string; // halt for the day if realized loss exceeds this % of equity
+  MAX_OPEN_POSITIONS?: string; // cap concurrent positions
+  SELF_CONSISTENCY?: string; // number of LLM samples to vote on normal decisions (1 = off)
+  DEBATE_ENABLED?: string; // "true" to allow multi-agent debate on abnormal events
 
   // Groq (3 separate orgs)
   GROQ_API_KEY_1?: string;
@@ -83,12 +91,37 @@ export interface Indicators {
   macdHist: number;
   atr14: number;
   atrPct: number; // atr14 / price * 100
+  adx14: number; // trend strength (≥25 trending, <20 choppy)
   bbUpper: number;
   bbLower: number;
   bbMid: number;
   volume: number;
   volumeSma20: number;
+  changePct: number; // % change over the loaded window (relative-strength proxy)
 }
+
+/** Market regime classification driving which strategy applies. */
+export type Regime = "trend_up" | "trend_down" | "range" | "choppy";
+
+/** Rule-based (pre-LLM) read of one symbol — produced by the free watcher. */
+export interface Signal {
+  symbol: string;
+  regime: Regime;
+  bias: "long" | "short" | "flat"; // suggested direction (spot: short ⇒ stay in cash)
+  strength: number; // 0-100 composite conviction
+  reasons: string[];
+}
+
+/** A ranked candidate the agent may act on. */
+export interface Candidate {
+  symbol: string;
+  snapshot: MarketSnapshot;
+  signal: Signal;
+  score: number; // composite selection score
+}
+
+/** How a fired event should be handled. */
+export type RouteKind = "none" | "normal" | "debate";
 
 /** A multi-timeframe snapshot of the market at one instant. */
 export interface MarketSnapshot {
@@ -118,8 +151,8 @@ export interface Decision {
 
 // ── Wallet & position ─────────────────────────────────────────────────────────
 
-export interface WalletBalance {
-  baseCoin: number; // e.g. BTC held
-  quoteCoin: number; // e.g. USDC held
-  totalEquityQuote: number; // approx equity in quote currency
+export interface Wallet {
+  coins: Record<string, number>; // coin symbol → wallet balance
+  quote: number; // balance of the quote coin (e.g. USDC)
+  totalEquityQuote: number; // total account equity in quote currency
 }

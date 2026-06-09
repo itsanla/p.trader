@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Ctx } from "./context";
 import { logger } from "./logger";
-import type { Action, Decision, Indicators, MarketSnapshot, WalletBalance } from "./types";
+import type { Action, Decision, Indicators, MarketSnapshot, Wallet } from "./types";
 import type { OpenTrade } from "./db";
 
 const log = logger("analysis");
@@ -26,7 +26,7 @@ export const decisionSchema = z.object({
 });
 
 /** Clamp/normalize a raw model object into a well-formed Decision. */
-function normalizeDecision(raw: z.infer<typeof decisionSchema>): Decision {
+export function normalizeDecision(raw: z.infer<typeof decisionSchema>): Decision {
   const ez = raw.entryZone;
   const entryZone: [number, number] | null =
     ez && ez.length >= 2 ? [ez[0], ez[1]] : ez && ez.length === 1 ? [ez[0], ez[0]] : null;
@@ -66,15 +66,18 @@ function fmtTf(label: string, i: Indicators): string {
 
 export interface DecisionContext {
   snapshot: MarketSnapshot;
-  wallet: WalletBalance;
+  wallet: Wallet;
+  baseCoin: string; // base coin of the snapshot's symbol (e.g. "BTC")
   openTrades: OpenTrade[];
   triggerReasons: string[];
   similarMemories: string[];
   performance: { wins: number; losses: number; avgPnlPct: number };
 }
 
-function buildUserPrompt(c: DecisionContext): string {
-  const { snapshot: s, wallet, openTrades, triggerReasons, similarMemories, performance } = c;
+export const DECISION_SYSTEM_PROMPT = SYSTEM_PROMPT;
+
+export function buildUserPrompt(c: DecisionContext): string {
+  const { snapshot: s, wallet, baseCoin, openTrades, triggerReasons, similarMemories, performance } = c;
   const lines: string[] = [];
   lines.push(`PASANGAN: ${s.symbol} | Harga terkini: ${s.price}`);
   lines.push(`Pemicu analisa: ${triggerReasons.join("; ") || "terjadwal"}`);
@@ -84,7 +87,7 @@ function buildUserPrompt(c: DecisionContext): string {
   lines.push(fmtTf("4H", s.tf4h));
   lines.push(fmtTf("1D", s.tf1d));
   lines.push("");
-  lines.push(`SALDO: ${wallet.baseCoin} base, ${wallet.quoteCoin} quote, ekuitas ≈ ${wallet.totalEquityQuote.toFixed(2)}`);
+  lines.push(`SALDO: ${wallet.coins[baseCoin] ?? 0} ${baseCoin}, ${wallet.quote.toFixed(2)} quote, ekuitas ≈ ${wallet.totalEquityQuote.toFixed(2)}`);
   if (openTrades.length) {
     lines.push("POSISI TERBUKA:");
     for (const t of openTrades) {
