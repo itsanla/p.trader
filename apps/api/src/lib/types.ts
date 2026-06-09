@@ -127,6 +127,7 @@ export type RouteKind = "none" | "normal" | "debate";
 export interface MarketSnapshot {
   symbol: string;
   price: number;
+  spreadPct: number; // live bid/ask spread % (real crossing cost)
   tf1h: Indicators;
   tf4h: Indicators;
   tf1d: Indicators;

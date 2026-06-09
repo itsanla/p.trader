@@ -18,7 +18,7 @@ import {
 } from "./db";
 import { computeIndicators } from "./indicators";
 import { logger } from "./logger";
-import { killSwitchTripped, longStop, longTarget, sizeLong } from "./risk";
+import { killSwitchTripped, longStop, longTarget, roundTripCostFrac, sizeLong, tradeCostQuote } from "./risk";
 import { buildSignal, detectRegime, rankCandidates } from "./strategy";
 import { evaluateRoute } from "./triggers";
 import type { Decision, MarketSnapshot } from "./types";
@@ -46,16 +46,17 @@ function todayStr(): string {
 
 async function buildSnapshot(ctx: Ctx, symbol: string): Promise<MarketSnapshot | null> {
   try {
-    const [c1h, c4h, c1d, price] = await Promise.all([
+    const [c1h, c4h, c1d, ticker] = await Promise.all([
       ctx.bybit.getKline(symbol, "1h", 200),
       ctx.bybit.getKline(symbol, "4h", 120),
       ctx.bybit.getKline(symbol, "1d", 90),
-      ctx.bybit.getLastPrice(symbol),
+      ctx.bybit.getTicker(symbol),
     ]);
     if (!c1h.length) return null;
     return {
       symbol,
-      price: price || c1h[c1h.length - 1].close,
+      price: ticker.last || c1h[c1h.length - 1].close,
+      spreadPct: ticker.spreadPct,
       tf1h: computeIndicators(c1h),
       tf4h: computeIndicators(c4h),
       tf1d: computeIndicators(c1d),
@@ -97,6 +98,12 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
   const openTrades = await getAllOpenTrades(db);
   const openSymbols = new Set(openTrades.map((t) => t.symbol));
 
+  // Rich per-symbol scan summary so the 2-hour demo is fully auditable in the logs.
+  for (const s of snaps) {
+    const sig = buildSignal(s);
+    log.info("scan", { sym: s.symbol, price: s.price, regime: sig.regime, bias: sig.bias, strength: Math.round(sig.strength), rsi1h: +s.tf1h.rsi14.toFixed(1), adx4h: +s.tf4h.adx14.toFixed(1) });
+  }
+
   // 3. EXIT pass — protective exits are rule-based (fast, deterministic, no LLM).
   let exits = 0;
   for (const t of openTrades) {
@@ -122,12 +129,17 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
         debateEnabled: cfg.debateEnabled,
         minStrength: MIN_ENTRY_STRENGTH,
       });
+      log.info("entry.route", { sym: best.symbol, route: route.route, abnormal: route.abnormal, strength: Math.round(best.signal.strength), reasons: route.reasons.join("; ") });
       if (route.route !== "none") {
         entry = { ...entry, ...(await considerEntry(ctx, best.snapshot, route.route, route.reasons, equity, wallet.quote, await getOpenHeatQuote(db))) };
       }
+    } else {
+      log.info("entry.skip", { reason: best ? `kandidat terbaik ${best.symbol} strength ${Math.round(best.signal.strength)} < ${MIN_ENTRY_STRENGTH}` : "tak ada kandidat long (regime tak mendukung)" });
     }
+  } else {
+    log.info("entry.skip", { reason: `posisi penuh (${cfg.maxOpenPositions})` });
   }
-  log.info("cycle.done", { scanned: snaps.length, exits, action: entry.action, route: entry.route });
+  log.info("cycle.done", { scanned: snaps.length, exits, action: entry.action, executed: entry.executed, route: entry.route, note: entry.note });
   return entry;
 }
 
@@ -145,8 +157,10 @@ function exitReason(snap: MarketSnapshot, t: OpenTrade): string | null {
 }
 
 async function executeExit(ctx: Ctx, snap: MarketSnapshot, t: OpenTrade, reason: string): Promise<void> {
-  const pnl = (snap.price - t.price) * t.qty;
-  log.info("exit", { symbol: t.symbol, reason, pnl: pnl.toFixed(2), execute: ctx.cfg.executeTrades });
+  // PnL net of round-trip trading costs (entry + exit fees + slippage).
+  const cost = tradeCostQuote(ctx.cfg, t.qty, t.price, snap.price, snap.spreadPct);
+  const pnl = (snap.price - t.price) * t.qty - cost;
+  log.info("exit", { symbol: t.symbol, reason, gross: ((snap.price - t.price) * t.qty).toFixed(2), cost: cost.toFixed(2), pnlNet: pnl.toFixed(2), execute: ctx.cfg.executeTrades });
   if (ctx.cfg.executeTrades) {
     await ctx.bybit.placeMarketOrder({ symbol: t.symbol, side: "Sell", qtyBase: t.qty, orderLinkId: crypto.randomUUID().replace(/-/g, "").slice(0, 32) });
   }
@@ -230,9 +244,9 @@ async function maybeEnterLong(ctx: Ctx, snap: MarketSnapshot, decision: Decision
   // Prefer the model's stop if sane, else ATR-based; target honors min R:R.
   const atrStop = longStop(price, snap.tf1h.atr14, cfg.atrStopMult);
   const stop = decision.stopLoss && decision.stopLoss < price && decision.stopLoss > atrStop * 0.9 ? decision.stopLoss : atrStop;
-  const target = decision.takeProfit?.[0] && decision.takeProfit[0] > price ? decision.takeProfit[0] : longTarget(price, stop, cfg.minRR);
+  const target = decision.takeProfit?.[0] && decision.takeProfit[0] > price ? decision.takeProfit[0] : longTarget(price, stop, cfg.minRR, cfg, snap.spreadPct);
 
-  const sized = sizeLong({ cfg, equity, quoteAvailable, price, stop, target, openHeatQuote: openHeat });
+  const sized = sizeLong({ cfg, equity, quoteAvailable, price, stop, target, openHeatQuote: openHeat, spreadPct: snap.spreadPct });
   if (sized.qty <= 0) return { executed: false, note: sized.reasons.join("; ") || "size 0", stop, target };
 
   let rules;
@@ -275,14 +289,17 @@ export async function evaluateOutcomes(ctx: Ctx): Promise<number> {
     }
     if (!nowPrice) continue;
     const movePct = ((nowPrice - a.price) / a.price) * 100;
+    // Net of round-trip trading costs for actual trades — so the learning signal and
+    // win-rate reflect what the account would really keep, not a fee-free fantasy.
+    const costPct = a.action === "HOLD" ? 0 : roundTripCostFrac(ctx.cfg) * 100;
     let pnlPct: number;
     let correct: boolean;
     if (a.action === "BUY") {
-      pnlPct = movePct;
-      correct = movePct >= CORRECT_PNL_PCT;
+      pnlPct = movePct - costPct;
+      correct = pnlPct >= CORRECT_PNL_PCT;
     } else if (a.action === "SELL") {
-      pnlPct = -movePct;
-      correct = -movePct >= CORRECT_PNL_PCT;
+      pnlPct = -movePct - costPct;
+      correct = pnlPct >= CORRECT_PNL_PCT;
     } else {
       pnlPct = 0;
       correct = Math.abs(movePct) < CORRECT_PNL_PCT;

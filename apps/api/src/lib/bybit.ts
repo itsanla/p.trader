@@ -98,9 +98,20 @@ export class Bybit {
   }
 
   async getLastPrice(symbol: string): Promise<number> {
+    return (await this.getTicker(symbol)).last;
+  }
+
+  /** Live ticker: last price + best bid/ask + measured spread % (the real cost of crossing). */
+  async getTicker(symbol: string): Promise<{ last: number; bid: number; ask: number; spreadPct: number }> {
     const qs = new URLSearchParams({ category: this.category, symbol }).toString();
-    const data = await this.publicGet<{ list: { lastPrice: string }[] }>("/v5/market/tickers", qs);
-    return Number(data.list?.[0]?.lastPrice ?? 0);
+    const data = await this.publicGet<{ list: { lastPrice: string; bid1Price: string; ask1Price: string }[] }>("/v5/market/tickers", qs);
+    const t = data.list?.[0];
+    const last = Number(t?.lastPrice ?? 0);
+    const bid = Number(t?.bid1Price ?? 0);
+    const ask = Number(t?.ask1Price ?? 0);
+    const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : last;
+    const spreadPct = mid > 0 && ask > bid ? ((ask - bid) / mid) * 100 : 0;
+    return { last: last || mid, bid, ask, spreadPct };
   }
 
   async getInstrumentRules(symbol: string): Promise<InstrumentRules> {

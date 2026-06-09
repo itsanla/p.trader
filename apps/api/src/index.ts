@@ -131,6 +131,13 @@ app.post("/evaluate", async (c) => {
 // ── Scheduled handler (cron: every minute, UTC) ───────────────────────────────
 async function runScheduled(env: TraderEnv): Promise<void> {
   const ctx = buildCtx(env);
+  // Cron can double-fire during propagation; claim the minute bucket so a duplicate
+  // invocation doesn't run a second cycle (and risk a duplicate order). Fail-open.
+  const minute = Math.floor(Date.now() / 60_000);
+  if (!(await ctx.cache.claim(`cron:${minute}`, 120))) {
+    log.info("cron.duplicate", { minute });
+    return;
+  }
   try {
     const result = await runCycle(ctx);
     log.info("cron.cycle", { ran: result.ran, exits: result.exits, action: result.action, executed: result.executed, note: result.note });

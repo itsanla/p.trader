@@ -16,9 +16,31 @@ export function longStop(price: number, atr14: number, mult: number): number {
   return price - mult * atr14;
 }
 
-/** First take-profit honoring the minimum reward:risk. */
-export function longTarget(price: number, stop: number, minRR: number): number {
-  return price + minRR * (price - stop);
+/**
+ * Round-trip cost fraction = both-side fees + crossing the spread on entry AND exit.
+ * Bybit spot taker fee is 0.1%/side (verified in their fee docs); the spread is the
+ * LIVE measured bid/ask gap when provided, else falls back to the configured assumption.
+ */
+export function roundTripCostFrac(cfg: TradingConfig, spreadPct?: number): number {
+  const feeFrac = 2 * (cfg.feePct / 100);
+  const spreadFrac = (spreadPct != null ? spreadPct : 2 * cfg.slippagePct) / 100;
+  return feeFrac + spreadFrac;
+}
+
+/** Trading cost in quote currency for a position of `qty` at `entry`→`exit`. */
+export function tradeCostQuote(cfg: TradingConfig, qty: number, entry: number, exit: number, spreadPct?: number): number {
+  return (entry + exit) * qty * 0.5 * roundTripCostFrac(cfg, spreadPct);
+}
+
+/**
+ * First take-profit honoring the minimum reward:risk AFTER costs. We inflate the gross
+ * target so the NET reward (minus round-trip fees + real spread) still meets minRR — the
+ * bot won't take a trade whose edge is eaten by trading costs.
+ */
+export function longTarget(price: number, stop: number, minRR: number, cfg: TradingConfig, spreadPct?: number): number {
+  const risk = price - stop;
+  const costPerUnit = price * roundTripCostFrac(cfg, spreadPct);
+  return price + minRR * risk + costPerUnit;
 }
 
 /**
@@ -33,14 +55,18 @@ export function sizeLong(args: {
   stop: number;
   target: number;
   openHeatQuote: number; // sum of risk already on open positions
+  spreadPct?: number; // live measured spread (real crossing cost)
 }): SizedOrder {
-  const { cfg, equity, quoteAvailable, price, stop, target } = args;
+  const { cfg, equity, quoteAvailable, price, stop, target, spreadPct } = args;
   const reasons: string[] = [];
   const perUnitRisk = price - stop;
   if (perUnitRisk <= 0) return { qty: 0, riskQuote: 0, rr: 0, reasons: ["stop ≥ price (invalid)"] };
 
-  const rr = (target - price) / perUnitRisk;
-  if (rr < cfg.minRR) reasons.push(`R:R ${rr.toFixed(2)} < ${cfg.minRR} → skip`);
+  // Reward:risk NET of round-trip fees + real spread — the edge must survive trading costs.
+  const costFrac = roundTripCostFrac(cfg, spreadPct);
+  const netReward = target - price - price * costFrac;
+  const rr = netReward / perUnitRisk;
+  if (rr < cfg.minRR) reasons.push(`R:R net ${rr.toFixed(2)} < ${cfg.minRR} (biaya ${(costFrac * 100).toFixed(3)}%) → skip`);
 
   const riskQuote = equity * (cfg.riskPct / 100);
   // Portfolio heat: don't let total open risk exceed the cap.

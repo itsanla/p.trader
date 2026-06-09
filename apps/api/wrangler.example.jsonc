@@ -4,63 +4,48 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-05-29",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": {
-    "enabled": true
-  },
+  "observability": { "enabled": true },
   "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "trader",
-      "database_id": "<your-d1-database-id>",
-      "migrations_dir": "drizzle/migrations"
-    }
+    { "binding": "DB", "database_name": "trader", "database_id": "<your-d1-database-id>", "migrations_dir": "drizzle/migrations" }
   ],
-  "vectorize": [
-    {
-      "binding": "VECTORIZE",
-      "index_name": "linda-memory",
-      "remote": true
-    }
-  ],
-  "ai": {
-    "binding": "AI",
-    "remote": true
-  },
-  "triggers": {
-    // Every 5 minutes (UTC). Cheap rule-based watcher; LLM only wakes on a trigger.
-    "crons": ["*/5 * * * *"]
-  },
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "linda-memory", "remote": true }],
+  "ai": { "binding": "AI", "remote": true },
+  "triggers": { "crons": ["* * * * *"] }, // every minute (zero-token watcher; LLM only on triggers)
   "vars": {
     "APP_TIMEZONE": "Asia/Jakarta",
-    "LOGS_INGEST_URL": "",
+    "LOGS_INGEST_URL": "https://logs.anla.my.id/ingest", // ships logs to the logs service
+    "ADMIN_SECRET": "",
 
-    // ── Trading config ─────────────────────────────────────────────────────────
+    // Trading
     "TRADING_SYMBOL": "BTCUSDC",
-    "BASE_COIN": "BTC",
+    "UNIVERSE": "BTCUSDC,ETHUSDC,SOLUSDC,XRPUSDC",
     "QUOTE_COIN": "USDC",
     "BYBIT_BASE_URL": "https://api-demo.bybit.com",
-    "EXECUTE_TRADES": "true", // "false" = paper mode (decide + record, no order)
+    "EXECUTE_TRADES": "true", // "false" = paper mode
+
+    // Risk
     "MIN_CONFIDENCE": "65",
     "RISK_PCT": "1",
     "MAX_POSITION_PCT": "20",
-    "SELF_CONSISTENCY": "1", // 3 = majority-vote 3 LLM samples for steadier calls
+    "PORTFOLIO_HEAT_PCT": "6",
+    "MIN_RR": "2",
+    "ATR_STOP_MULT": "2",
+    "FEE_PCT": "0.1", // taker fee per side
+    "SLIPPAGE_PCT": "0.05", // assumed spread/slippage per side
+    "KILL_SWITCH_PCT": "5",
+    "MAX_OPEN_POSITIONS": "3",
 
-    // ── Groq (each key MUST be a separate org to multiply daily limits) ────────
+    // AI
+    "SELF_CONSISTENCY": "3",
+    "DEBATE_ENABLED": "true",
     "GROQ_CHAT_MODEL": "openai/gpt-oss-120b",
     "GROQ_UTILITY_MODEL": "llama-3.1-8b-instant",
     "GROQ_API_KEY_1": "<groq-key-org-1>",
     "GROQ_API_KEY_2": "<groq-key-org-2>",
     "GROQ_API_KEY_3": "<groq-key-org-3>",
 
-    // ── Bybit demo keys ────────────────────────────────────────────────────────
+    // Bybit demo
     "BYBIT_API_KEY": "<bybit-demo-key>",
-    "BYBIT_API_SECRET": "<bybit-demo-secret>",
-
-    // Optional: guards POST /run and /evaluate (sent as x-admin-secret header).
-    "ADMIN_SECRET": "",
-
-    // Optional: Upstash Redis keeps live key rate-limit state across cron runs.
-    "UPSTASH_REDIS_REST_URL": "",
-    "UPSTASH_REDIS_REST_TOKEN": ""
+    "BYBIT_API_SECRET": "<bybit-demo-secret>"
   }
 }

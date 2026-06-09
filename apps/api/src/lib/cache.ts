@@ -27,11 +27,17 @@ export class Cache {
 
   // ── Idempotency ───────────────────────────────────────────────────────────────
 
+  // NOTE: this Upstash DB is SHARED with p.agent, so every key is prefixed `trader:`
+  // to avoid colliding with that app's identically-named keys (e.g. groq:state:1).
+  private k(suffix: string): string {
+    return `trader:${suffix}`;
+  }
+
   /** Claim a marker; true if first time seen (caller should proceed). Fail-open. */
   async claim(key: string, ttl = DEDUP_TTL): Promise<boolean> {
     if (!this.redis) return true;
     try {
-      const res = await this.redis.set(`claim:${key}`, "1", { nx: true, ex: ttl });
+      const res = await this.redis.set(this.k(`claim:${key}`), "1", { nx: true, ex: ttl });
       return res === "OK";
     } catch (err) {
       log.warn("claim.failed", { key, err: err instanceof Error ? err : String(err) });
@@ -44,7 +50,7 @@ export class Cache {
   async getKeyState(index: number): Promise<Partial<KeyState> | null> {
     if (!this.redis) return null;
     try {
-      return await this.redis.get<Partial<KeyState>>(`groq:state:${index}`);
+      return await this.redis.get<Partial<KeyState>>(this.k(`groq:state:${index}`));
     } catch {
       return null;
     }
@@ -53,7 +59,7 @@ export class Cache {
   async setKeyState(index: number, state: Partial<KeyState>): Promise<void> {
     if (!this.redis) return;
     try {
-      await this.redis.set(`groq:state:${index}`, state, { ex: KEYSTATE_TTL });
+      await this.redis.set(this.k(`groq:state:${index}`), state, { ex: KEYSTATE_TTL });
     } catch {
       /* ignore */
     }
