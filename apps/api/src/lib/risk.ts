@@ -58,31 +58,27 @@ export function sizeLong(args: {
   spreadPct?: number; // live measured spread (real crossing cost)
 }): SizedOrder {
   const { cfg, equity, quoteAvailable, price, stop, target, spreadPct } = args;
-  const reasons: string[] = [];
   const perUnitRisk = price - stop;
   if (perUnitRisk <= 0) return { qty: 0, riskQuote: 0, rr: 0, reasons: ["stop ≥ price (invalid)"] };
+  const stopFrac = perUnitRisk / price; // fractional distance to stop
 
-  // Reward:risk NET of round-trip fees + real spread — the edge must survive trading costs.
+  // Reward:risk NET of fees + real spread (loosened gate — momentum exits are dynamic).
   const costFrac = roundTripCostFrac(cfg, spreadPct);
-  const netReward = target - price - price * costFrac;
-  const rr = netReward / perUnitRisk;
-  if (rr < cfg.minRR) reasons.push(`R:R net ${rr.toFixed(2)} < ${cfg.minRR} (biaya ${(costFrac * 100).toFixed(3)}%) → skip`);
+  const rr = (target - price - price * costFrac) / perUnitRisk;
+  if (rr < cfg.minRR) return { qty: 0, riskQuote: 0, rr, reasons: [`R:R net ${rr.toFixed(2)} < ${cfg.minRR} → skip`] };
 
-  const riskQuote = equity * (cfg.riskPct / 100);
-  // Portfolio heat: don't let total open risk exceed the cap.
+  // ALLOCATION-FIRST (proactive: keep capital deployed). Start from the target position
+  // size, then clamp by the per-trade risk ceiling, portfolio heat, and available cash.
+  let notional = equity * (cfg.maxPositionPct / 100);
+  notional = Math.min(notional, (equity * (cfg.maxRiskPct / 100)) / stopFrac); // per-trade risk ceiling
   const heatRoom = equity * (cfg.portfolioHeatPct / 100) - args.openHeatQuote;
-  if (heatRoom <= 0) reasons.push(`portfolio heat penuh (${cfg.portfolioHeatPct}%)`);
-  const effectiveRisk = Math.min(riskQuote, Math.max(0, heatRoom));
+  if (heatRoom <= 0) return { qty: 0, riskQuote: 0, rr, reasons: [`portfolio heat penuh (${cfg.portfolioHeatPct}%)`] };
+  notional = Math.min(notional, heatRoom / stopFrac); // total-risk cap
+  notional = Math.min(notional, quoteAvailable * (1 - cfg.cashReservePct / 100)); // cash cap (avoids insufficient-balance)
 
-  let qty = effectiveRisk / perUnitRisk;
-  qty = Math.min(qty, (equity * (cfg.maxPositionPct / 100)) / price); // position cap
-  // Spend at most (available − reserve): keeps headroom for fees + price moves between
-  // sizing and the market fill, which is what caused Bybit's "insufficient balance".
-  const spendable = quoteAvailable * (1 - cfg.cashReservePct / 100);
-  qty = Math.min(qty, spendable / price);
-
-  if (reasons.length) return { qty: 0, riskQuote: 0, rr, reasons };
-  return { qty, riskQuote: effectiveRisk, rr, reasons };
+  const qty = notional / price;
+  if (qty <= 0) return { qty: 0, riskQuote: 0, rr, reasons: ["notional 0"] };
+  return { qty, riskQuote: notional * stopFrac, rr, reasons: [] };
 }
 
 /** Daily kill-switch: true ⇒ trading must halt for the rest of the day. */

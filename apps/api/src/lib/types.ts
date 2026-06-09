@@ -24,8 +24,9 @@ export interface TraderEnv {
   SCREEN_TOP_N?: string; // screener: how many momentum leaders to deep-scan
   EXECUTE_TRADES?: string; // "true" | "false" — false = paper mode (decide + record, no order)
   MIN_CONFIDENCE?: string; // skip BUY/SELL below this (0-100)
-  RISK_PCT?: string; // % of quote equity to risk per trade
-  MAX_POSITION_PCT?: string; // hard cap: max % of equity in one position
+  RISK_PCT?: string; // (legacy) % of quote equity to risk per trade
+  MAX_RISK_PCT?: string; // ceiling: max % of equity lost if a position's stop is hit
+  MAX_POSITION_PCT?: string; // target/cap: % of equity deployed per position
   CASH_RESERVE_PCT?: string; // never spend the last N% of available quote (avoids "insufficient balance")
   COOLDOWN_MINUTES?: string; // don't re-attempt the same symbol within this window
   PORTFOLIO_HEAT_PCT?: string; // max total open risk across positions

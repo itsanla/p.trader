@@ -175,10 +175,17 @@ export interface SelectionOutput {
   modelUsed: string;
 }
 
-const SELECT_SYSTEM = `Kamu trader momentum kripto yang PROAKTIF dan disiplin pada data. Tujuanmu PROFIT, bukan menahan modal.
-Dari daftar koin TERKUAT (pemimpin momentum) berikut, pilih SATU yang paling layak di-BUY sekarang berdasarkan konfluensi: tren naik (EMA tersusun), momentum (RSI 45-70 & MACD positif), dan konfirmasi volume.
-Pilih 'HOLD' HANYA jika benar-benar tak ada yang punya setup bersih (mis. semua overbought ekstrem RSI>78, atau tak ada konfirmasi sama sekali). Default-mu adalah BERTINDAK bila ada peluang wajar.
-Wajib sertakan stop_loss yang masuk akal (berbasis struktur/ATR). Jawab hanya sesuai skema.`;
+const SELECT_SYSTEM = `Kamu MANAJER PORTFOLIO MOMENTUM yang proaktif. Filosofimu: modal harus SELALU BEKERJA di koin-koin TERKUAT, bukan menganggur sebagai kas. Kas menganggur = biaya peluang (tidak menghasilkan apa-apa).
+
+Kamu punya slot posisi kosong dan kas. TUGAS UTAMAMU: isi slot dengan koin momentum TERBAIK yang tersedia SEKARANG dari daftar pemimpin momentum.
+
+Aturan pilih:
+- BUY kandidat terbaik (momentum + tren naik terkuat). Ini default-mu.
+- RSI 55-80 dengan EMA naik = momentum SEHAT, BOLEH dan BAGUS dibeli — momentum sering berlanjut. JANGAN terlalu takut "overbought"; jangan menolak hanya karena RSI 70-an atau MACD datar sesaat.
+- Pilih 'HOLD' HANYA jika SEMUA kandidat benar-benar buruk: tren JELAS turun (EMA menurun/harga di bawah EMA50), ATAU blow-off ekstrem (RSI > 85).
+- Bandingkan kandidat secara relatif: pilih yang PALING kuat, bukan yang sempurna.
+
+Wajib stop_loss masuk akal (berbasis ATR/struktur, biasanya 1.5-2× ATR di bawah harga). Jawab hanya sesuai skema.`;
 
 /** Ask the LLM to pick the single best BUY among the screened momentum leaders. */
 export async function runSelection(ctx: Ctx, candidates: SelectionCandidate[], wallet: Wallet, performance: { wins: number; losses: number; avgPnlPct: number }): Promise<SelectionOutput> {
@@ -190,9 +197,16 @@ export async function runSelection(ctx: Ctx, candidates: SelectionCandidate[], w
   });
   const total = performance.wins + performance.losses;
   const perf = total > 0 ? `\nPerforma lalu: win-rate ${((performance.wins / total) * 100).toFixed(0)}% (${total} trade), rata PnL ${performance.avgPnlPct.toFixed(2)}%` : "";
-  const prompt = `KANDIDAT MOMENTUM TERKUAT (saldo ${wallet.quote.toFixed(0)} ${(wallet.coins && Object.keys(wallet.coins)[0]) ? "quote" : ""}):\n${lines.join("\n")}${perf}\n\nPilih BUY terbaik atau HOLD.`;
+  const prompt = `Kas menganggur: ${wallet.quote.toFixed(0)} USDT — idealnya di-deploy ke koin terkuat (jangan dibiarkan diam).\nKANDIDAT MOMENTUM TERKUAT (sudah lolos screening likuiditas):\n${lines.join("\n")}${perf}\n\nPilih SATU koin TERBAIK untuk BUY sekarang. HOLD hanya jika SEMUA jelas buruk (tren turun / blow-off RSI>85).`;
 
-  const r = await ctx.groq.generateStructured(selectionSchema, [{ role: "user", content: prompt }], { systemPrompt: SELECT_SYSTEM, temperature: 0.3 });
+  let r;
+  try {
+    r = await ctx.groq.generateStructured(selectionSchema, [{ role: "user", content: prompt }], { systemPrompt: SELECT_SYSTEM, temperature: 0.3 });
+  } catch (err) {
+    // A malformed model response must NOT crash the cycle — treat as HOLD this minute.
+    log.warn("selection.failed", { err: err instanceof Error ? err.message : String(err) });
+    return { pick: null, confidence: 0, stopLoss: null, takeProfit: null, reasoning: "model error → HOLD", keyUsed: "", modelUsed: "" };
+  }
   const o = r.object;
   const pickRaw = (o.pick ?? "").trim().toUpperCase();
   const pick = pickRaw && pickRaw !== "HOLD" && candidates.some((c) => c.symbol === pickRaw) ? pickRaw : null;

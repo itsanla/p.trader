@@ -166,12 +166,15 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
   return entry;
 }
 
-/** A momentum leader is tradeable-long if it's not clearly downtrending or blown-off. */
+/** A momentum leader is tradeable-long unless it's clearly downtrending or blown-off.
+ * Loosened for a PROACTIVE (always-deployed) posture: we want a wide candidate pool and
+ * let the AI rank them relatively, rather than pre-filtering out anything but perfect. */
 function isLongEligible(s: MarketSnapshot): boolean {
   const h = s.tf1h;
-  if (detectRegime(s) === "trend_down") return false;
-  if (h.price < h.ema200) return false; // below long-term mean → not a leader
-  if (h.rsi14 >= 80) return false; // blow-off top → chasing risk
+  if (detectRegime(s) === "trend_down") return false; // avoid clear downtrends
+  if (h.rsi14 >= 85) return false; // blow-off top only
+  // Otherwise PASS — these are already momentum leaders (positive 24h, liquid). Let the
+  // proactive AI rank them and pick the strongest; don't pre-filter to "perfect" only.
   return true;
 }
 
@@ -357,7 +360,7 @@ const EVAL_AGE_MS = 12 * 3600_000;
 const CORRECT_PNL_PCT = 0.5;
 
 export async function evaluateOutcomes(ctx: Ctx): Promise<number> {
-  const due = await getUnevaluatedAnalyses(ctx.db, Date.now() - EVAL_AGE_MS, 20);
+  const due = await getUnevaluatedAnalyses(ctx.db, Date.now() - EVAL_AGE_MS, 5);
   if (due.length === 0) return 0;
   const priceCache = new Map<string, number>();
   let scored = 0;

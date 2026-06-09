@@ -14,8 +14,9 @@ export interface TradingConfig {
   bybitBaseUrl: string;
   executeTrades: boolean; // false = paper mode (decide + record, never send an order)
   minConfidence: number; // skip BUY/SELL below this
-  riskPct: number; // % of quote equity risked per trade (entry→stop distance)
-  maxPositionPct: number; // hard cap: max % of equity in one position
+  riskPct: number; // (legacy) % of quote equity risked per trade
+  maxRiskPct: number; // ceiling: max % of equity lost if the stop is hit
+  maxPositionPct: number; // target % of equity deployed per position
   cashReservePct: number; // keep this % of available quote unspent (avoids insufficient-balance)
   cooldownMinutes: number; // don't re-attempt the same symbol within this window
   portfolioHeatPct: number; // max total open risk across all positions
@@ -59,7 +60,8 @@ export function loadConfig(env: TraderEnv): TradingConfig {
     executeTrades: bool(env.EXECUTE_TRADES, true),
     minConfidence: num(env.MIN_CONFIDENCE, 65),
     riskPct: num(env.RISK_PCT, 1),
-    maxPositionPct: num(env.MAX_POSITION_PCT, 10),
+    maxRiskPct: num(env.MAX_RISK_PCT, 2),
+    maxPositionPct: num(env.MAX_POSITION_PCT, 18),
     cashReservePct: num(env.CASH_RESERVE_PCT, 5),
     cooldownMinutes: num(env.COOLDOWN_MINUTES, 20),
     portfolioHeatPct: num(env.PORTFOLIO_HEAT_PCT, 6),

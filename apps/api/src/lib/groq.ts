@@ -131,16 +131,13 @@ export class GroqManager {
     return this.keys.length;
   }
 
-  /** Load cached live state (restricted/limited/remaining) for every key. */
+  /** Prepare key state. We deliberately SKIP reading per-key state from Redis: with a
+   * ~1-call/minute bot we never approach rate limits, and with 15 keys those reads would
+   * cost 15 subrequests every cycle (blowing the Worker subrequest budget). In-memory
+   * failover within the invocation is sufficient. */
   async hydrate(): Promise<void> {
     if (this.hydrated) return;
     this.hydrated = true;
-    await Promise.all(
-      this.keys.map(async (entry) => {
-        const cached = await this.cache.getKeyState(entry.state.index);
-        if (cached) entry.state = { ...entry.state, ...cached, maskedKey: entry.state.maskedKey };
-      }),
-    );
     this.refreshLimits();
   }
 
