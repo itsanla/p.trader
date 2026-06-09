@@ -76,7 +76,10 @@ export function sizeLong(args: {
 
   let qty = effectiveRisk / perUnitRisk;
   qty = Math.min(qty, (equity * (cfg.maxPositionPct / 100)) / price); // position cap
-  qty = Math.min(qty, (quoteAvailable * 0.99) / price); // can't spend more quote than we have
+  // Spend at most (available − reserve): keeps headroom for fees + price moves between
+  // sizing and the market fill, which is what caused Bybit's "insufficient balance".
+  const spendable = quoteAvailable * (1 - cfg.cashReservePct / 100);
+  qty = Math.min(qty, spendable / price);
 
   if (reasons.length) return { qty: 0, riskQuote: 0, rr, reasons };
   return { qty, riskQuote: effectiveRisk, rr, reasons };

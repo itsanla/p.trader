@@ -16,6 +16,8 @@ export interface TradingConfig {
   minConfidence: number; // skip BUY/SELL below this
   riskPct: number; // % of quote equity risked per trade (entry→stop distance)
   maxPositionPct: number; // hard cap: max % of equity in one position
+  cashReservePct: number; // keep this % of available quote unspent (avoids insufficient-balance)
+  cooldownMinutes: number; // don't re-attempt the same symbol within this window
   portfolioHeatPct: number; // max total open risk across all positions
   minRR: number; // minimum reward:risk to accept a trade
   atrStopMult: number; // stop distance = mult × ATR
@@ -57,7 +59,9 @@ export function loadConfig(env: TraderEnv): TradingConfig {
     executeTrades: bool(env.EXECUTE_TRADES, true),
     minConfidence: num(env.MIN_CONFIDENCE, 65),
     riskPct: num(env.RISK_PCT, 1),
-    maxPositionPct: num(env.MAX_POSITION_PCT, 20),
+    maxPositionPct: num(env.MAX_POSITION_PCT, 10),
+    cashReservePct: num(env.CASH_RESERVE_PCT, 5),
+    cooldownMinutes: num(env.COOLDOWN_MINUTES, 20),
     portfolioHeatPct: num(env.PORTFOLIO_HEAT_PCT, 6),
     minRR: num(env.MIN_RR, 2),
     atrStopMult: num(env.ATR_STOP_MULT, 2),

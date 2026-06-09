@@ -52,7 +52,7 @@ app.get("/", (c) => c.json({ ok: true, service: "trader-api" }));
 app.get("/wallet", async (c) => {
   const ctx = buildCtx(c.env);
   try {
-    const wallet = await ctx.bybit.getWalletBalance();
+    const wallet = await ctx.bybit.getPortfolio();
     return c.json({ quoteCoin: ctx.cfg.quoteCoin, ...wallet });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -69,7 +69,7 @@ app.get("/equity", async (c) => {
   const history = await getEquityHistory(ctx.db, 720);
   let current: { totalUsd: number; coins: { coin: string; usd: number; balance: number }[] } | null = null;
   try {
-    const w = await ctx.bybit.getWalletBalance();
+    const w = await ctx.bybit.getPortfolio();
     current = {
       totalUsd: w.totalEquityQuote,
       coins: Object.entries(w.coinsUsd)

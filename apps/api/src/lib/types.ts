@@ -26,6 +26,8 @@ export interface TraderEnv {
   MIN_CONFIDENCE?: string; // skip BUY/SELL below this (0-100)
   RISK_PCT?: string; // % of quote equity to risk per trade
   MAX_POSITION_PCT?: string; // hard cap: max % of equity in one position
+  CASH_RESERVE_PCT?: string; // never spend the last N% of available quote (avoids "insufficient balance")
+  COOLDOWN_MINUTES?: string; // don't re-attempt the same symbol within this window
   PORTFOLIO_HEAT_PCT?: string; // max total open risk across positions
   MIN_RR?: string; // minimum reward:risk to take a trade
   ATR_STOP_MULT?: string; // stop = entry ∓ mult × ATR

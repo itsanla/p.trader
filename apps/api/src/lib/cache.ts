@@ -45,6 +45,27 @@ export class Cache {
     }
   }
 
+  // ── Per-symbol cooldown (stop hammering the same coin every cycle) ────────────
+
+  /** True if the symbol is cooling down (recently attempted/exited). Fail-open = false. */
+  async onCooldown(symbol: string): Promise<boolean> {
+    if (!this.redis) return false;
+    try {
+      return (await this.redis.get(this.k(`cooldown:${symbol}`))) != null;
+    } catch {
+      return false;
+    }
+  }
+
+  async setCooldown(symbol: string, minutes: number): Promise<void> {
+    if (!this.redis) return;
+    try {
+      await this.redis.set(this.k(`cooldown:${symbol}`), "1", { ex: Math.max(60, Math.round(minutes * 60)) });
+    } catch {
+      /* ignore */
+    }
+  }
+
   // ── Live Groq key state (per key index) ───────────────────────────────────────
 
   async getKeyState(index: number): Promise<Partial<KeyState> | null> {

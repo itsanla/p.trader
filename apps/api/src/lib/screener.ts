@@ -1,4 +1,4 @@
-import type { Bybit } from "./bybit";
+import type { RawTicker } from "./bybit";
 import type { TradingConfig } from "./config";
 import { logger } from "./logger";
 
@@ -21,8 +21,7 @@ const LEVERAGED = /(\d+L|\d+S|UP|DOWN)$/; // BTC3L, ETH5S, FOOUP, FOODOWN …
 const STABLES = new Set(["USDC", "DAI", "FDUSD", "TUSD", "EUR", "USDE", "BUSD", "USDD", "PYUSD"]);
 
 /** Screen the whole spot market down to the top-N most liquid momentum leaders. */
-export async function screenMarket(bybit: Bybit, cfg: TradingConfig): Promise<ScreenedCoin[]> {
-  const tickers = await bybit.getAllTickers();
+export function screenMarket(tickers: RawTicker[], cfg: TradingConfig): ScreenedCoin[] {
   const quote = cfg.quoteCoin;
   const coins: ScreenedCoin[] = [];
   let scanned = 0;

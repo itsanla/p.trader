@@ -162,7 +162,14 @@ export default function Dashboard() {
           <ul className="space-y-1 text-sm">
             {status.recentAnalyses.slice(0, 8).map((a) => {
               const name = a.symbol.replace(/USDT$|USDC$/, "");
-              const label = a.action === "BUY" ? `🟢 Beli ${name}` : a.action === "SELL" ? `🔴 Jual ${name}` : `⚪ Tahan (belum ada peluang bagus)`;
+              const label =
+                a.action === "HOLD"
+                  ? "⚪ Tahan (belum ada peluang bagus)"
+                  : a.executed === 1
+                    ? a.action === "BUY"
+                      ? `🟢 Beli ${name}`
+                      : `🔴 Jual ${name}`
+                    : `🟡 Lirik ${name} — belum dibeli (belum lolos syarat risiko)`;
               return (
                 <li key={a.id} className="flex items-center justify-between">
                   <span>

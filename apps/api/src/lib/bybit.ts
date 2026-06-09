@@ -45,6 +45,38 @@ export interface RawTicker {
   price24hPcnt: string;
 }
 
+const STABLE_USD = new Set(["USDT", "USDC", "DAI", "FDUSD", "TUSD", "BUSD", "USDD", "PYUSD"]);
+
+/** Build a coin→USD-price map from live tickers (e.g. BTC→last of BTCUSDT). */
+export function usdPriceMap(tickers: RawTicker[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const t of tickers) {
+    if (t.symbol.endsWith("USDT")) {
+      const base = t.symbol.slice(0, -4);
+      const px = Number(t.lastPrice);
+      if (px > 0) m.set(base, px);
+    }
+  }
+  return m;
+}
+
+/**
+ * Re-value a wallet using LIVE market prices. Bybit's DEMO account reports a frozen
+ * usdValue/totalEquity, so we compute portfolio value ourselves: balance × live price
+ * (stablecoins = $1). This is the number that actually moves with the market.
+ */
+export function walletUsd(raw: Wallet, prices: Map<string, number>): Wallet {
+  const coinsUsd: Record<string, number> = {};
+  let total = 0;
+  for (const [coin, bal] of Object.entries(raw.coins)) {
+    const px = STABLE_USD.has(coin) ? 1 : prices.get(coin) ?? 0;
+    const usd = bal * px;
+    coinsUsd[coin] = usd;
+    total += usd;
+  }
+  return { coins: raw.coins, coinsUsd, quote: raw.quote, totalEquityQuote: total };
+}
+
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -169,6 +201,12 @@ export class Bybit {
     const totalEquityQuote = Number(acct?.totalEquity ?? "0") || quote;
     log.info("wallet", { quote, equity: totalEquityQuote, coins: Object.keys(coins).length });
     return { coins, coinsUsd, quote, totalEquityQuote };
+  }
+
+  /** Wallet valued at LIVE market prices (fixes Bybit demo's frozen usdValue). */
+  async getPortfolio(): Promise<Wallet> {
+    const [raw, tickers] = await Promise.all([this.getWalletBalance(), this.getAllTickers()]);
+    return walletUsd(raw, usdPriceMap(tickers));
   }
 
   // ── Trading (signed) ──────────────────────────────────────────────────────────

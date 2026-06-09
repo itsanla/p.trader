@@ -1,5 +1,5 @@
 import { runSelection, type SelectionCandidate } from "./analysis";
-import { floorToStep } from "./bybit";
+import { floorToStep, usdPriceMap, walletUsd } from "./bybit";
 import type { Ctx } from "./context";
 import {
   closeTrade,
@@ -83,13 +83,14 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
     return { ran: false, note: "bot OFF — perdagangan dihentikan total" };
   }
 
-  // 1. Equity + daily kill-switch.
+  // 1. Equity (valued at LIVE prices — demo's usdValue is frozen) + daily kill-switch.
   let wallet: Wallet;
+  let tickers;
   try {
-    wallet = await ctx.bybit.getWalletBalance();
+    const [raw, tk] = await Promise.all([ctx.bybit.getWalletBalance(), ctx.bybit.getAllTickers()]);
+    tickers = tk;
+    wallet = walletUsd(raw, usdPriceMap(tk));
   } catch (err) {
-    // Surface the real reason (was silently swallowed) — e.g. a signed-request rejection
-    // that only happens in the scheduled context. The error now carries Bybit's body snippet.
     log.error("cycle.wallet.failed", { err: err instanceof Error ? err.message : String(err) });
     return { ran: false, note: "wallet unavailable" };
   }
@@ -111,11 +112,8 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
     return { ran: false, note: `kill-switch aktif (rugi hari ini ${realized.toFixed(2)})` };
   }
 
-  // 2. Screen the WHOLE market in one call → deep-scan the momentum leaders + held coins.
-  const screened = await screenMarket(ctx.bybit, cfg).catch((err) => {
-    log.error("screen.failed", { err: err instanceof Error ? err.message : String(err) });
-    return [];
-  });
+  // 2. Screen the WHOLE market (reuse the tickers we already fetched) → momentum leaders.
+  const screened = screenMarket(tickers, cfg);
   const openTrades = await getAllOpenTrades(db);
   const openSymbols = new Set(openTrades.map((t) => t.symbol));
   const seedBySymbol = new Map(screened.map((c) => [c.symbol, c]));
@@ -147,16 +145,19 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
   // 4. ENTRY pass — the AI picks the best BUY from the long-eligible momentum leaders.
   let entry: CycleResult = { ran: true, scanned: snaps.length, exits };
   if (openTrades.length - exits < cfg.maxOpenPositions) {
-    const shortlist = screened
+    let shortlist: SelectionCandidate[] = screened
       .filter((c) => !openSymbols.has(c.symbol))
-      .map((c) => ({ symbol: c.symbol, snapshot: snapBySymbol.get(c.symbol), chg24h: c.chg24h }))
-      .filter((c): c is { symbol: string; snapshot: MarketSnapshot; chg24h: number } => c.snapshot != null && isLongEligible(c.snapshot))
+      .map((c) => ({ symbol: c.symbol, snapshot: snapBySymbol.get(c.symbol)!, chg24h: c.chg24h }))
+      .filter((c) => c.snapshot != null && isLongEligible(c.snapshot))
       .slice(0, 12);
+    // Drop symbols on cooldown (recently attempted or exited) — stops re-hammering the same coin.
+    const cd = await Promise.all(shortlist.map((c) => ctx.cache.onCooldown(c.symbol)));
+    shortlist = shortlist.filter((_, i) => !cd[i]);
 
     if (shortlist.length > 0) {
       entry = { ...entry, ...(await selectAndEnter(ctx, shortlist, equity, wallet, await getOpenHeatQuote(db))) };
     } else {
-      log.info("entry.skip", { reason: "tak ada momentum leader yang long-eligible" });
+      log.info("entry.skip", { reason: "tak ada momentum leader yang long-eligible (atau semua cooldown)" });
     }
   } else {
     log.info("entry.skip", { reason: `posisi penuh (${cfg.maxOpenPositions})` });
@@ -197,6 +198,8 @@ async function executeExit(ctx: Ctx, snap: MarketSnapshot, t: OpenTrade, reason:
   }
   await closeTrade(ctx.db, t.id, snap.price, pnl);
   await storeMemory(ctx, t.symbol, `${t.symbol} | EXIT (${reason}) @ ${snap.price} | PnL ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} quote`);
+  // Don't immediately re-buy what we just sold.
+  await ctx.cache.setCooldown(t.symbol, ctx.cfg.cooldownMinutes);
 }
 
 /** Let the AI pick the best BUY from the momentum shortlist, then risk-gate + execute it. */
@@ -252,6 +255,8 @@ async function selectAndEnter(ctx: Ctx, shortlist: SelectionCandidate[], equity:
     });
   }
   await storeMemory(ctx, snap.symbol, buildFingerprint(snap, { action: "BUY", confidence: sel.confidence }));
+  // Cool the symbol down so we don't re-attempt it every minute (whether filled or rejected).
+  await ctx.cache.setCooldown(snap.symbol, ctx.cfg.cooldownMinutes);
   return { entrySymbol: snap.symbol, action: "BUY", confidence: sel.confidence, executed: exec.executed, note: exec.note };
 }
 
