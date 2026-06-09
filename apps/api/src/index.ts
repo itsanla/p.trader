@@ -9,9 +9,22 @@ import { evaluateOutcomes, runCycle } from "./lib/trader";
 import type { TraderEnv } from "./lib/types";
 import { buildUsage } from "./lib/usage";
 
+export { TraderTicker } from "./ticker";
+
 const log = logger("http");
 
 const app = new Hono<{ Bindings: TraderEnv }>();
+
+// RPC surface of the ticker DO. The stub is created in the APAC region so its Bybit
+// fetches egress from a non-geo-blocked location.
+interface TickerRpc {
+  ensureRunning(): Promise<{ alarmAt: number | null; colo: string }>;
+  stop(): Promise<void>;
+}
+function ticker(env: TraderEnv): TickerRpc {
+  const id = env.TICKER.idFromName("singleton");
+  return env.TICKER.get(id, { locationHint: "apac" }) as unknown as TickerRpc;
+}
 
 app.use("*", cors({ origin: (o) => o ?? "*", allowHeaders: ["Content-Type", "x-admin-secret"], allowMethods: ["GET", "POST", "OPTIONS"] }));
 
@@ -132,32 +145,33 @@ app.post("/evaluate", async (c) => {
   return c.json({ scored: await evaluateOutcomes(ctx) });
 });
 
-// ── Scheduled handler (cron: every minute, UTC) ───────────────────────────────
-async function runScheduled(env: TraderEnv): Promise<void> {
-  const ctx = buildCtx(env);
-  // Cron can double-fire during propagation; claim the minute bucket so a duplicate
-  // invocation doesn't run a second cycle (and risk a duplicate order). Fail-open.
-  const minute = Math.floor(Date.now() / 60_000);
-  if (!(await ctx.cache.claim(`cron:${minute}`, 120))) {
-    log.info("cron.duplicate", { minute });
-    return;
-  }
-  try {
-    const result = await runCycle(ctx);
-    log.info("cron.cycle", { ran: result.ran, exits: result.exits, action: result.action, executed: result.executed, note: result.note });
-  } catch (err) {
-    log.error("cron.cycle.failed", { err: err instanceof Error ? err : String(err) });
-  }
-  try {
-    await evaluateOutcomes(ctx);
-  } catch (err) {
-    log.error("cron.evaluate.failed", { err: err instanceof Error ? err : String(err) });
-  }
-}
+// ── Autonomous ticker (Durable Object pinned to APAC) ─────────────────────────
+app.get("/tick/status", async (c) => c.json(await ticker(c.env).ensureRunning()));
 
+app.post("/tick/start", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
+  return c.json(await ticker(c.env).ensureRunning());
+});
+
+app.post("/tick/stop", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden" }, 403);
+  await ticker(c.env).stop();
+  return c.json({ stopped: true });
+});
+
+// ── Scheduled handler (cron: keepalive only) ──────────────────────────────────
+// The cron runs in an arbitrary (often geo-blocked) colo, so it must NOT touch Bybit.
+// It only pokes the APAC-pinned ticker DO to make sure its self-rescheduling alarm is
+// alive; all real work (and Bybit egress) happens inside the DO, in APAC.
 export default {
   fetch: app.fetch,
   scheduled: async (_event: ScheduledController, env: TraderEnv, ctx: ExecutionContext) => {
-    ctx.waitUntil(runScheduled(env).finally(() => flushLogsAsync(env)));
+    ctx.waitUntil(
+      ticker(env)
+        .ensureRunning()
+        .then((s) => log.info("cron.keepalive", { alarmAt: s.alarmAt }))
+        .catch((err) => log.error("cron.keepalive.failed", { err: err instanceof Error ? err.message : String(err) }))
+        .finally(() => flushLogsAsync(env)),
+    );
   },
 };

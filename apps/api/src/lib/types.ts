@@ -7,6 +7,7 @@ export interface TraderEnv {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
   AI: Ai;
+  TICKER: DurableObjectNamespace; // autonomous loop, pinned to APAC (see ticker.ts)
 
   // App config
   APP_TIMEZONE?: string;
