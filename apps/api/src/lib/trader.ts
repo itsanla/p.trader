@@ -21,7 +21,7 @@ import { logger } from "./logger";
 import { killSwitchTripped, longStop, longTarget, roundTripCostFrac, sizeLong, tradeCostQuote } from "./risk";
 import { buildSignal, detectRegime, rankCandidates } from "./strategy";
 import { evaluateRoute } from "./triggers";
-import type { Decision, MarketSnapshot } from "./types";
+import type { Decision, MarketSnapshot, Wallet } from "./types";
 import { buildFingerprint, searchSimilar, storeMemory } from "./vector";
 
 const log = logger("trader");
@@ -79,10 +79,16 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
   }
 
   // 1. Equity + daily kill-switch.
-  let equity = 0;
-  let wallet = await ctx.bybit.getWalletBalance().catch(() => null);
-  if (!wallet) return { ran: false, note: "wallet unavailable" };
-  equity = wallet.totalEquityQuote;
+  let wallet: Wallet;
+  try {
+    wallet = await ctx.bybit.getWalletBalance();
+  } catch (err) {
+    // Surface the real reason (was silently swallowed) — e.g. a signed-request rejection
+    // that only happens in the scheduled context. The error now carries Bybit's body snippet.
+    log.error("cycle.wallet.failed", { err: err instanceof Error ? err.message : String(err) });
+    return { ran: false, note: "wallet unavailable" };
+  }
+  const equity = wallet.totalEquityQuote;
   const today = todayStr();
   if (bot.haltedDate === today) return { ran: false, note: "halted hari ini (kill-switch)" };
   const realized = await getRealizedPnlToday(db);
@@ -131,7 +137,7 @@ export async function runCycle(ctx: Ctx): Promise<CycleResult> {
       });
       log.info("entry.route", { sym: best.symbol, route: route.route, abnormal: route.abnormal, strength: Math.round(best.signal.strength), reasons: route.reasons.join("; ") });
       if (route.route !== "none") {
-        entry = { ...entry, ...(await considerEntry(ctx, best.snapshot, route.route, route.reasons, equity, wallet.quote, await getOpenHeatQuote(db))) };
+        entry = { ...entry, ...(await considerEntry(ctx, best.snapshot, route.route, route.reasons, equity, wallet, await getOpenHeatQuote(db))) };
       }
     } else {
       log.info("entry.skip", { reason: best ? `kandidat terbaik ${best.symbol} strength ${Math.round(best.signal.strength)} < ${MIN_ENTRY_STRENGTH}` : "tak ada kandidat long (regime tak mendukung)" });
@@ -174,12 +180,11 @@ async function considerEntry(
   route: "normal" | "debate",
   reasons: string[],
   equity: number,
-  quoteAvailable: number,
+  wallet: Wallet,
   openHeat: number,
 ): Promise<Partial<CycleResult>> {
   const { db, cfg, bybit } = ctx;
   const baseCoin = bybit.baseOf(snap.symbol);
-  const wallet = await bybit.getWalletBalance();
 
   const [similar, performance] = await Promise.all([
     searchSimilar(ctx, snap.symbol, buildFingerprint(snap)),
@@ -190,7 +195,7 @@ async function considerEntry(
   const out = route === "debate" ? await runDebate(ctx, dctx) : await runDecision(ctx, dctx);
   const decision = out.decision;
 
-  const exec = await maybeEnterLong(ctx, snap, decision, equity, quoteAvailable, openHeat);
+  const exec = await maybeEnterLong(ctx, snap, decision, equity, wallet.quote, openHeat);
 
   const analysisId = crypto.randomUUID();
   await insertAnalysis(db, {

@@ -1,6 +1,6 @@
 {
-  "name": "agent-web",
-  "compatibility_date": "2026-05-29",
+  "name": "trader-web",
+  "compatibility_date": "2026-06-09",
   "assets": {
     "directory": "./out",
     "not_found_handling": "404-page",

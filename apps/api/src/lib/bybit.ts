@@ -62,6 +62,11 @@ export class Bybit {
   private readonly apiSecret: string;
   private readonly category = "spot" as const;
   readonly quoteCoin: string;
+  // Offset = Bybit server time − local clock. Cloudflare FREEZES Date.now() inside the
+  // scheduled (cron) handler, so a signature built from Date.now() can land outside
+  // Bybit's recv_window and be rejected — only in cron, which matched our symptom.
+  // Signing against server time makes the timestamp correct in ANY execution context.
+  private timeOffset: number | null = null;
 
   constructor(env: TraderEnv, cfg: TradingConfig) {
     this.baseUrl = cfg.bybitBaseUrl.replace(/\/$/, "");
@@ -178,41 +183,68 @@ export class Bybit {
 
   private async publicGet<T>(path: string, qs: string): Promise<T> {
     const url = qs ? `${this.baseUrl}${path}?${qs}` : `${this.baseUrl}${path}`;
-    const res = await fetch(url, { headers: { "Content-Type": "application/json" } });
-    return this.unwrap<T>(await res.json(), path);
+    return this.send<T>(path, () => fetch(url, { headers: { "Content-Type": "application/json" } }));
+  }
+
+  /** Sync to Bybit server time once per instance, so signing is clock-independent. */
+  private async signTimestamp(): Promise<string> {
+    if (this.timeOffset == null) {
+      try {
+        const serverMs = await this.getServerTime();
+        this.timeOffset = serverMs - Date.now();
+      } catch {
+        this.timeOffset = 0; // fall back to local clock if /v5/market/time is unreachable
+      }
+    }
+    return Math.round(Date.now() + this.timeOffset).toString();
   }
 
   private async signedGet<T>(path: string, qs: string): Promise<T> {
-    const ts = Date.now().toString();
-    const sign = await hmacSha256Hex(this.apiSecret, ts + this.apiKey + RECV_WINDOW + qs);
-    const res = await fetch(`${this.baseUrl}${path}?${qs}`, { headers: this.authHeaders(ts, sign) });
-    return this.unwrap<T>(await res.json(), path);
+    return this.send<T>(path, async () => {
+      const ts = await this.signTimestamp();
+      const sign = await hmacSha256Hex(this.apiSecret, ts + this.apiKey + RECV_WINDOW + qs);
+      return fetch(`${this.baseUrl}${path}?${qs}`, { headers: this.authHeaders(ts, sign) });
+    });
   }
 
   private async signedPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
-    const ts = Date.now().toString();
-    const json = JSON.stringify(body);
-    const sign = await hmacSha256Hex(this.apiSecret, ts + this.apiKey + RECV_WINDOW + json);
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers: { ...this.authHeaders(ts, sign), "Content-Type": "application/json" },
-      body: json,
+    return this.send<T>(path, async () => {
+      const ts = await this.signTimestamp();
+      const json = JSON.stringify(body);
+      const sign = await hmacSha256Hex(this.apiSecret, ts + this.apiKey + RECV_WINDOW + json);
+      return fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.authHeaders(ts, sign), "Content-Type": "application/json" }, body: json });
     });
-    return this.unwrap<T>(await res.json(), path);
   }
 
   private authHeaders(ts: string, sign: string): Record<string, string> {
-    return {
-      "X-BAPI-API-KEY": this.apiKey,
-      "X-BAPI-TIMESTAMP": ts,
-      "X-BAPI-RECV-WINDOW": RECV_WINDOW,
-      "X-BAPI-SIGN": sign,
-    };
+    return { "X-BAPI-API-KEY": this.apiKey, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": RECV_WINDOW, "X-BAPI-SIGN": sign };
   }
 
-  private unwrap<T>(json: unknown, path: string): T {
-    const r = json as BybitResponse<T>;
-    if (r.retCode !== 0) throw new Error(`Bybit ${path} retCode=${r.retCode} ${r.retMsg}`);
-    return r.result;
+  /**
+   * Execute a request factory with ONE retry, parsing defensively. Bybit (esp. the demo
+   * gateway under load) occasionally returns a non-JSON body — read text first and surface
+   * a clear error with status + snippet instead of a cryptic "Unexpected token" crash.
+   */
+  private async send<T>(path: string, make: () => Promise<Response>): Promise<T> {
+    let lastErr = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await make();
+        const text = await res.text();
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          throw new Error(`non-JSON HTTP ${res.status}: ${text.slice(0, 100).replace(/\s+/g, " ").trim()}`);
+        }
+        const r = json as BybitResponse<T>;
+        if (r.retCode !== 0) throw new Error(`retCode=${r.retCode} ${r.retMsg}`);
+        return r.result;
+      } catch (err) {
+        lastErr = err instanceof Error ? err.message : String(err);
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    throw new Error(`Bybit ${path}: ${lastErr}`);
   }
 }

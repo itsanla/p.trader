@@ -42,7 +42,11 @@ app.get("/wallet", async (c) => {
     const wallet = await ctx.bybit.getWalletBalance();
     return c.json({ quoteCoin: ctx.cfg.quoteCoin, ...wallet });
   } catch (err) {
-    return c.json({ error: err instanceof Error ? err.message : String(err) }, 502);
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error("wallet.failed", { err: msg });
+    return c.json({ error: msg }, 502);
+  } finally {
+    flushLogs(c.env, c.executionCtx);
   }
 });
 
